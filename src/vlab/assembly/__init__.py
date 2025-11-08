@@ -1,0 +1,2 @@
+"""Assembly simulation module"""
+

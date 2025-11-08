@@ -1,0 +1,69 @@
+# VSim Configuration File
+# Pharmaceutical-Grade Settings
+
+project:
+  name: "VSim"
+  version: "1.0.0"
+  description: "Viral Simulation & Analysis Platform"
+
+paths:
+  data_dir: "data"
+  models_dir: "models"
+  results_dir: "results"
+  logs_dir: "logs"
+  cache_dir: ".cache"
+
+genome_analysis:
+  min_orf_length: 100
+  genetic_code: 1  # Standard genetic code
+  confidence_threshold: 0.95
+  max_orf_search: 1000
+
+structure_prediction:
+  method: "esmfold"  # Options: alphafold2, esmfold, colabfold, hybrid
+  use_gpu: true
+  use_api: true  # Use API services for structure prediction
+  model_confidence: 0.9
+  max_recycles: 3
+
+environmental:
+  temperature_range: [4, 40]  # Celsius
+  ph_range: [5.0, 9.0]
+  humidity_range: [0, 100]  # Percentage
+  stability_models: ["thermal", "chemical", "enzymatic"]
+
+cell_interaction:
+  receptor_databases: ["UniProt", "PDB", "IntAct"]
+  binding_affinity_threshold: -7.0  # kcal/mol
+  entry_mechanism_detection: true
+
+cancer_analysis:
+  oncolytic_scoring: true
+  cancer_cell_types: ["HeLa", "MCF-7", "A549", "HepG2"]
+  selectivity_threshold: 0.8
+
+ml_prediction:
+  ensemble_models: true
+  cross_validation_folds: 10
+  confidence_intervals: true
+  prediction_models: ["xgboost", "lightgbm", "neural_network"]
+
+web_interface:
+  host: "0.0.0.0"
+  port: 8080
+  debug: false
+  max_upload_size: 100  # MB
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "logs/vsim.log"
+
+database:
+  type: "sqlite"
+  path: "data/vsim.db"
+
+api:
+  rate_limit: 100  # requests per minute
+  timeout: 300  # seconds
+

@@ -1,0 +1,46 @@
+# Core Dependencies
+biopython>=1.81
+numpy>=1.26.0
+pandas>=2.0.0
+scipy>=1.11.0
+
+# Machine Learning & AI
+scikit-learn>=1.3.0
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+xgboost>=2.0.0
+lightgbm>=4.0.0
+transformers>=4.30.0  # For protein language models
+
+# Structure Prediction & Visualization (Optional - install for real structure prediction)
+# Uncomment to enable:
+# esm>=2.0.0  # For ESMFold structure prediction
+# py3Dmol>=2.0.0  # For 3D visualization
+matplotlib>=3.7.0
+plotly>=5.17.0
+
+# Web Framework
+flask>=3.0.0
+flask-cors>=4.0.0
+jinja2>=3.1.0
+
+# Data Processing
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# Utilities
+tqdm>=4.66.0
+joblib>=1.3.0
+python-dotenv>=1.0.0
+pyyaml>=6.0.0
+backoff>=2.2.0  # For retry logic
+aiohttp>=3.9.0  # For async HTTP requests
+duckdb>=0.9.0  # For data warehouse (optional)
+pyarrow>=14.0.0  # For Parquet support (optional)
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+

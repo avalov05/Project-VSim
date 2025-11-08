@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VSim - Viral Simulation & Analysis Platform</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 40px;
+            text-align: center;
+        }
+        
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        
+        .header p {
+            font-size: 1.2em;
+            opacity: 0.9;
+        }
+        
+        .content {
+            padding: 40px;
+        }
+        
+        .upload-section {
+            background: #f8f9fa;
+            border: 3px dashed #667eea;
+            border-radius: 15px;
+            padding: 40px;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        
+        .upload-section.dragover {
+            background: #e8ecff;
+            border-color: #764ba2;
+        }
+        
+        input[type="file"] {
+            display: none;
+        }
+        
+        .upload-btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 15px 40px;
+            border: none;
+            border-radius: 10px;
+            font-size: 1.1em;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+        
+        .upload-btn:hover {
+            transform: scale(1.05);
+        }
+        
+        .file-info {
+            margin-top: 20px;
+            padding: 15px;
+            background: white;
+            border-radius: 10px;
+            display: none;
+        }
+        
+        .analyze-btn {
+            background: #27ae60;
+            color: white;
+            padding: 15px 40px;
+            border: none;
+            border-radius: 10px;
+            font-size: 1.1em;
+            cursor: pointer;
+            margin-top: 20px;
+            display: none;
+        }
+        
+        .analyze-btn:hover {
+            background: #229954;
+        }
+        
+        .analyze-btn:disabled {
+            background: #95a5a6;
+            cursor: not-allowed;
+        }
+        
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 40px;
+        }
+        
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            width: 50px;
+            height: 50px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .results {
+            display: none;
+            margin-top: 30px;
+        }
+        
+        .result-card {
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        
+        .result-card h3 {
+            color: #667eea;
+            margin-bottom: 15px;
+        }
+        
+        .metric {
+            display: inline-block;
+            margin: 10px 20px;
+            padding: 15px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        
+        .metric-label {
+            font-weight: bold;
+            color: #7f8c8d;
+            font-size: 0.9em;
+        }
+        
+        .metric-value {
+            font-size: 1.8em;
+            color: #2c3e50;
+            margin-top: 5px;
+        }
+        
+        .error {
+            background: #e74c3c;
+            color: white;
+            padding: 15px;
+            border-radius: 10px;
+            margin-top: 20px;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🧬 VSim</h1>
+            <p>Viral Simulation & Analysis Platform</p>
+            <p style="font-size: 0.9em; margin-top: 10px;">Pharmaceutical-Grade Viral Genome Analysis</p>
+        </div>
+        
+        <div class="content">
+            <div class="upload-section" id="uploadSection">
+                <h2>Upload Viral Genome</h2>
+                <p style="margin: 20px 0;">Upload a FASTA file containing the viral genome sequence</p>
+                <input type="file" id="fileInput" accept=".fasta,.fa,.fas,.fsa">
+                <label for="fileInput" class="upload-btn">Choose File</label>
+                <div class="file-info" id="fileInfo"></div>
+                <button class="analyze-btn" id="analyzeBtn">Analyze Genome</button>
+            </div>
+            
+            <div class="loading" id="loading">
+                <div class="spinner"></div>
+                <p style="margin-top: 20px;">Analyzing genome... This may take a few minutes.</p>
+            </div>
+            
+            <div class="error" id="error"></div>
+            
+            <div class="results" id="results">
+                <h2>Analysis Results</h2>
+                <div id="resultsContent"></div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        const fileInput = document.getElementById('fileInput');
+        const fileInfo = document.getElementById('fileInfo');
+        const analyzeBtn = document.getElementById('analyzeBtn');
+        const uploadSection = document.getElementById('uploadSection');
+        const loading = document.getElementById('loading');
+        const results = document.getElementById('results');
+        const resultsContent = document.getElementById('resultsContent');
+        const error = document.getElementById('error');
+        
+        let selectedFile = null;
+        
+        fileInput.addEventListener('change', (e) => {
+            selectedFile = e.target.files[0];
+            if (selectedFile) {
+                fileInfo.style.display = 'block';
+                fileInfo.innerHTML = `
+                    <strong>Selected:</strong> ${selectedFile.name}<br>
+                    <strong>Size:</strong> ${(selectedFile.size / 1024).toFixed(2)} KB
+                `;
+                analyzeBtn.style.display = 'inline-block';
+            }
+        });
+        
+        uploadSection.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadSection.classList.add('dragover');
+        });
+        
+        uploadSection.addEventListener('dragleave', () => {
+            uploadSection.classList.remove('dragover');
+        });
+        
+        uploadSection.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadSection.classList.remove('dragover');
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                selectedFile = files[0];
+                fileInput.files = files;
+                fileInfo.style.display = 'block';
+                fileInfo.innerHTML = `
+                    <strong>Selected:</strong> ${selectedFile.name}<br>
+                    <strong>Size:</strong> ${(selectedFile.size / 1024).toFixed(2)} KB
+                `;
+                analyzeBtn.style.display = 'inline-block';
+            }
+        });
+        
+        analyzeBtn.addEventListener('click', async () => {
+            if (!selectedFile) return;
+            
+            analyzeBtn.disabled = true;
+            loading.style.display = 'block';
+            results.style.display = 'none';
+            error.style.display = 'none';
+            
+            const formData = new FormData();
+            formData.append('file', selectedFile);
+            
+            try {
+                const response = await fetch('/api/analyze', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    displayResults(data.results);
+                } else {
+                    showError(data.error || 'Analysis failed');
+                }
+            } catch (err) {
+                showError('Network error: ' + err.message);
+            } finally {
+                analyzeBtn.disabled = false;
+                loading.style.display = 'none';
+            }
+        });
+        
+        function displayResults(results) {
+            const summary = results.summary;
+            
+            resultsContent.innerHTML = `
+                <div class="result-card">
+                    <h3>Executive Summary</h3>
+                    <div class="metric">
+                        <div class="metric-label">Synthesis Feasibility</div>
+                        <div class="metric-value">${(summary.synthesis_feasibility * 100).toFixed(1)}%</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Overall Confidence</div>
+                        <div class="metric-value">${(summary.overall_confidence * 100).toFixed(1)}%</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Risk Assessment</div>
+                        <div class="metric-value">${summary.risk_assessment}</div>
+                    </div>
+                </div>
+                
+                <div class="result-card">
+                    <h3>Genome Analysis</h3>
+                    <p><strong>Genome Length:</strong> ${results.genome_analysis.length.toLocaleString()} bp</p>
+                    <p><strong>GC Content:</strong> ${(results.genome_analysis.gc_content * 100).toFixed(2)}%</p>
+                    <p><strong>ORFs Detected:</strong> ${results.genome_analysis.orfs.length}</p>
+                    <p><strong>Proteins Predicted:</strong> ${results.genome_analysis.proteins.length}</p>
+                </div>
+                
+                <div class="result-card">
+                    <h3>Environmental Dynamics</h3>
+                    <p><strong>Survival Time:</strong> ${results.environmental_dynamics.environmental_survival.average_survival_time_hours.toFixed(1)} hours</p>
+                    <p><strong>Thermal Stability:</strong> ${(results.environmental_dynamics.thermal_stability.stability_score * 100).toFixed(1)}%</p>
+                    <p><strong>pH Stability Range:</strong> ${results.environmental_dynamics.ph_stability.ph_range[0]} - ${results.environmental_dynamics.ph_stability.ph_range[1]}</p>
+                </div>
+                
+                <div class="result-card">
+                    <h3>Key Findings</h3>
+                    <ul>
+                        ${results.summary.key_findings.map(f => `<li>${f}</li>`).join('')}
+                    </ul>
+                </div>
+                
+                <div style="margin-top: 20px; text-align: center;">
+                    <a href="/api/report" target="_blank" class="upload-btn">View Full Report</a>
+                </div>
+            `;
+            
+            results.style.display = 'block';
+        }
+        
+        function showError(message) {
+            error.textContent = 'Error: ' + message;
+            error.style.display = 'block';
+        }
+    </script>
+</body>
+</html>
+

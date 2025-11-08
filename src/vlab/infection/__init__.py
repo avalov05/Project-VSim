@@ -1,0 +1,2 @@
+"""Infection simulation module"""
+
