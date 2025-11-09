@@ -142,14 +142,21 @@ class ViralGenomeHarvester:
         """Test if NCBI Entrez API is accessible"""
         try:
             logger.info("Testing NCBI connection with simple query...")
-            # Very simple test query
+            # Very simple test query (no usehistory to avoid WebEnv issues)
             test_handle = Entrez.esearch(
                 db="nucleotide",
                 term="NC_045512",  # SARS-CoV-2 reference genome
-                retmax=1
+                retmax=1,
+                usehistory="n"  # Don't use history for simple test
             )
             test_results = Entrez.read(test_handle)
             test_handle.close()
+            
+            # Check if we got valid results
+            if "Count" not in test_results:
+                logger.warning("⚠ NCBI connection test: Invalid response format")
+                return False
+                
             count = int(test_results.get("Count", 0))
             if count > 0:
                 logger.info(f"✓ NCBI connection test successful (found {count} results)")
@@ -159,11 +166,13 @@ class ViralGenomeHarvester:
                 return False
         except Exception as e:
             logger.error(f"✗ NCBI connection test failed: {e}")
+            logger.error(f"  Error type: {type(e).__name__}")
             logger.error("  NCBI Entrez API may not be accessible from this environment")
             logger.error("  Possible causes:")
             logger.error("    - Network firewall blocking NCBI")
             logger.error("    - NCBI blocking this IP address")
             logger.error("    - NCBI server issues")
+            logger.error("    - Rate limiting")
             return False
     
     async def _search_with_retry(self, search_term, max_retries=3, delay=5):
@@ -183,27 +192,78 @@ class ViralGenomeHarvester:
                     # Longer initial delay to avoid rate limits
                     await asyncio.sleep(2)
                 
-                # Use WebEnv for pagination
-                # Note: Entrez.email and Entrez.api_key are set in __init__
-                search_handle = Entrez.esearch(
-                    db="nucleotide",
-                    term=search_term,
-                    usehistory="y",
-                    retmax=1,
-                    rettype="count"  # Just get count first
-                )
-                search_results = Entrez.read(search_handle)
-                search_handle.close()
-                
-                webenv = search_results["WebEnv"]
-                query_key = search_results["QueryKey"]
-                total_count = int(search_results["Count"])
-                
-                logger.info(f"  ✓ Found {total_count:,} sequences")
-                return webenv, query_key, total_count
+                # Try without usehistory first (more reliable in Colab)
+                # NCBI API in Colab sometimes doesn't return WebEnv properly
+                try:
+                    logger.debug(f"  Trying search without usehistory (more reliable)...")
+                    search_handle = Entrez.esearch(
+                        db="nucleotide",
+                        term=search_term,
+                        usehistory="n",  # Don't use history - more reliable
+                        retmax=100  # Get first 100 IDs directly (can be increased)
+                    )
+                    search_results = Entrez.read(search_handle)
+                    search_handle.close()
+                    
+                    total_count = int(search_results.get("Count", 0))
+                    
+                    if total_count == 0:
+                        logger.warning(f"  ⚠ Search returned 0 results")
+                        return None, None, 0
+                    
+                    # Get IDs directly from IdList
+                    if "IdList" in search_results and len(search_results["IdList"]) > 0:
+                        id_list = search_results["IdList"]
+                        logger.info(f"  ✓ Found {total_count:,} sequences (got {len(id_list)} IDs directly)")
+                        # Return IDs directly - we'll handle this in the calling function
+                        return "DIRECT", id_list, total_count
+                    else:
+                        logger.warning(f"  ⚠ No IDs in response despite Count={total_count}")
+                        # Try with usehistory as fallback
+                        logger.debug(f"  Trying with usehistory as fallback...")
+                        raise KeyError("IdList")
+                        
+                except (KeyError, Exception) as e:
+                    # If direct mode fails, try with usehistory
+                    if "IdList" in str(e) or "WebEnv" in str(e) or isinstance(e, KeyError):
+                        try:
+                            logger.debug(f"  Trying search with usehistory (fallback)...")
+                            search_handle = Entrez.esearch(
+                                db="nucleotide",
+                                term=search_term,
+                                usehistory="y",
+                                retmax=1
+                            )
+                            search_results = Entrez.read(search_handle)
+                            search_handle.close()
+                            
+                            # Check if we got valid results with WebEnv
+                            if "WebEnv" not in search_results:
+                                logger.warning(f"  ⚠ WebEnv not in response even with usehistory=y")
+                                raise KeyError("WebEnv not available")
+                            
+                            webenv = search_results["WebEnv"]
+                            query_key = search_results["QueryKey"]
+                            total_count = int(search_results.get("Count", 0))
+                            
+                            if total_count == 0:
+                                logger.warning(f"  ⚠ Search returned 0 results")
+                                return None, None, 0
+                            
+                            logger.info(f"  ✓ Found {total_count:,} sequences (using WebEnv)")
+                            return webenv, query_key, total_count
+                        except Exception as e2:
+                            # Both methods failed
+                            logger.warning(f"  ⚠ Both direct and usehistory methods failed: {e2}")
+                            raise e2  # Re-raise to be handled by outer exception handler
+                    else:
+                        # Some other error - re-raise
+                        raise
                 
             except Exception as e:
                 error_msg = str(e)
+                error_type = type(e).__name__
+                
                 if "400" in error_msg or "Bad Request" in error_msg:
                     logger.warning(f"  ⚠ HTTP 400 Bad Request: {error_msg}")
                     
@@ -214,7 +274,7 @@ class ViralGenomeHarvester:
                             if "[TITLE]" in search_term:
                                 search_term = search_term.replace("[TITLE]", "")
                                 logger.info(f"    Retrying with simplified query (removed [TITLE]): {search_term[:80]}...")
-                            elif "complete genome" in search_term.lower():
+                            elif "complete genome" in search_term.lower() or "genome" in search_term.lower():
                                 # Try even simpler - just viruses
                                 search_term = "viruses[ORGN]"
                                 logger.info(f"    Retrying with simplest query: {search_term[:80]}...")
@@ -229,11 +289,19 @@ class ViralGenomeHarvester:
                     wait_time = 60 * (attempt + 1)  # Wait 60s, 120s, 180s
                     logger.warning(f"    Waiting {wait_time}s before retry...")
                     await asyncio.sleep(wait_time)
+                elif "WebEnv" in error_msg or error_type == "KeyError":
+                    logger.warning(f"  ⚠ Search response error: {error_msg}")
+                    logger.warning(f"    This may indicate NCBI API format issues or connection problems")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(5)  # Wait before retry
+                    else:
+                        logger.error(f"    Search failed after {max_retries} attempts due to response format issues")
                 else:
-                    logger.warning(f"  ⚠ Search error: {error_msg}")
+                    logger.warning(f"  ⚠ Search error ({error_type}): {error_msg}")
                 
                 if attempt == max_retries - 1:
                     logger.error(f"  ✗ Search failed after {max_retries} attempts")
+                    logger.error(f"    Error: {error_type}: {error_msg}")
                     logger.error(f"    Final search term tried: {search_term[:80]}...")
                     return None, None, 0
         
@@ -304,7 +372,15 @@ class ViralGenomeHarvester:
             successful_searches += 1
             
             try:
-                # Fetch IDs in batches (NCBI limit: 10,000 per request)
+                # Handle direct ID list (when WebEnv not available)
+                if webenv == "DIRECT" and isinstance(query_key, list):
+                    # We got IDs directly from the search
+                    new_ids = [str(id).strip() for id in query_key if id and str(id).strip()]
+                    all_ids.update(new_ids)
+                    logger.info(f"  Fetched {len(new_ids):,} IDs directly (limited batch)")
+                    continue
+                
+                # Fetch IDs in batches using WebEnv (NCBI limit: 10,000 per request)
                 remaining_slots = max_sequences - len(all_ids)
                 ids_to_fetch = min(total_count, remaining_slots)
                 

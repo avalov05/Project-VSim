@@ -6,10 +6,10 @@ Just paste this entire code into one Colab cell and run it!
 # ============================================================================
 # CONFIGURATION - EDIT THESE VALUES
 # ============================================================================
-GITHUB_REPO = "YOUR_USERNAME/Project-VSim"  # ← Change this to your repo
+GITHUB_REPO = "avalov05/Project-VSim"  # ← Change this to your repo
 EMAIL = "anton.valov05@gmail.com"  # ← Your email for NCBI
 API_KEY = "d7e5c7978697a8c4284af0fc71ce1a2b9808"  # ← Your NCBI API key (or "" if none)
-TOTAL_TARGET = 10000  # ← Start with 10000 for testing, 500000 for full training
+TOTAL_TARGET = 500000  # ← Start with 10000 for testing, 500000 for full training
 
 # Model settings (optimized for maximum quality)
 INPUT_DIM = 1024
