@@ -490,7 +490,9 @@ class ViralGenomeHarvester:
             for i in range(0, len(remaining_ids), batch_size):
                 batch_ids = remaining_ids[i:i + batch_size]
                 batch_num = i//batch_size + 1
-                task = self._fetch_batch_async(session, batch_ids, batch_num)
+                # Create a task from the coroutine
+                coro = self._fetch_batch_async(session, batch_ids, batch_num)
+                task = asyncio.create_task(coro)
                 batch_tasks[task] = (batch_num, batch_ids)
             
             logger.info(f"All batches queued. Starting parallel downloads...")
@@ -505,10 +507,10 @@ class ViralGenomeHarvester:
             last_save_time = time.time()
             
             # Process completed batches
-            for future in asyncio.as_completed(batch_tasks.keys()):
-                batch_num, batch_ids = batch_tasks[future]
+            for task in asyncio.as_completed(batch_tasks.keys()):
+                batch_num, batch_ids = batch_tasks[task]
                 try:
-                    batch_result = await future
+                    batch_result = await task
                     batch_size_actual = len(batch_result)
                     sequences.extend(batch_result)
                     completed_batches += 1
@@ -621,15 +623,17 @@ class ViralGenomeHarvester:
                     if not remaining_batch_ids:
                         continue  # All IDs in this batch were already downloaded
                     
-                    task = self._fetch_batch_async(session, remaining_batch_ids, f"R{batch_num}")
+                    # Create a task from the coroutine
+                    coro = self._fetch_batch_async(session, remaining_batch_ids, f"R{batch_num}")
+                    task = asyncio.create_task(coro)
                     retry_tasks[task] = (batch_num, remaining_batch_ids)
                 
                 # Process retry batches
                 if retry_tasks:
-                    for future in asyncio.as_completed(retry_tasks.keys()):
-                        batch_num, batch_ids = retry_tasks[future]
+                    for task in asyncio.as_completed(retry_tasks.keys()):
+                        batch_num, batch_ids = retry_tasks[task]
                         try:
-                            batch_result = await future
+                            batch_result = await task
                             batch_saved = 0
                             for seq in batch_result:
                                 if self._save_sequence_immediate(seq):
