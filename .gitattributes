@@ -1,0 +1,50 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Jupyter Notebooks - always use LF (JSON format requires consistent line endings)
+*.ipynb text eol=lf
+
+# Python files - use LF (Unix style)
+*.py text eol=lf
+
+# Shell scripts - use LF
+*.sh text eol=lf
+
+# Batch files - use CRLF (Windows style)
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Markdown files - use LF
+*.md text eol=lf
+
+# YAML files - use LF
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# JSON files - use LF
+*.json text eol=lf
+
+# Configuration files - use LF
+*.ini text eol=lf
+*.cfg text eol=lf
+*.conf text eol=lf
+
+# Documentation files - use LF
+*.txt text eol=lf
+*.rst text eol=lf
+
+# Binary files
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.tar.gz binary
+*.pth binary
+*.pkl binary
+*.h5 binary
+*.hdf5 binary
+

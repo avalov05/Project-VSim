@@ -20,6 +20,7 @@ import gzip
 import pickle
 import logging
 import sys
+import hashlib
 from datetime import datetime
 from tqdm import tqdm
 import threading
@@ -77,25 +78,59 @@ class ViralGenomeHarvester:
         self._load_checkpoint()
     
     def _load_checkpoint(self):
-        """Load checkpoint"""
+        """Load checkpoint and verify files exist"""
         try:
             if self.checkpoint_file.exists():
                 with open(self.checkpoint_file, 'r') as f:
                     checkpoint = json.load(f)
-                    self.completed_ids = set(checkpoint.get('completed_ids', []))
-                logger.info(f"Resumed with {len(self.completed_ids)} completed sequences")
+                    checkpoint_ids = set(checkpoint.get('completed_ids', []))
+                
+                # Verify files actually exist on disk
+                logger.info(f"Loading checkpoint: {len(checkpoint_ids):,} IDs marked as completed")
+                logger.info("Verifying files exist on disk...")
+                
+                verified_ids = set()
+                missing_count = 0
+                
+                # Check both train and val directories
+                for acc_id in checkpoint_ids:
+                    train_file = self.viable_dir / f"{acc_id}.fasta"
+                    val_file = self.val_viable_dir / f"{acc_id}.fasta"
+                    if train_file.exists() or val_file.exists():
+                        verified_ids.add(acc_id)
+                    else:
+                        missing_count += 1
+                        # Remove from checkpoint if file doesn't exist
+                        if missing_count <= 10:  # Log first 10
+                            logger.debug(f"File missing for {acc_id}, will re-download")
+                
+                self.completed_ids = verified_ids
+                
+                if missing_count > 0:
+                    logger.warning(f"Found {missing_count:,} IDs in checkpoint without files. Will re-download.")
+                    # Update checkpoint to remove missing IDs
+                    self._save_checkpoint()
+                else:
+                    logger.info(f"All {len(verified_ids):,} checkpoint IDs verified on disk")
+                    
+                logger.info(f"Resumed with {len(self.completed_ids):,} verified completed sequences")
         except Exception as e:
             logger.warning(f"Checkpoint load failed: {e}")
+            self.completed_ids = set()
     
     def _save_checkpoint(self):
-        """Save checkpoint"""
+        """Save checkpoint atomically"""
         try:
             checkpoint = {
                 'completed_ids': list(self.completed_ids),
                 'last_update': datetime.now().isoformat()
             }
-            with open(self.checkpoint_file, 'w') as f:
+            # Atomic write: write to temp file first, then rename
+            temp_file = self.checkpoint_file.with_suffix('.tmp')
+            with open(temp_file, 'w') as f:
                 json.dump(checkpoint, f)
+            # Atomic rename (works on Windows too)
+            temp_file.replace(self.checkpoint_file)
         except Exception as e:
             logger.warning(f"Checkpoint save failed: {e}")
     
@@ -183,21 +218,54 @@ class ViralGenomeHarvester:
                 logger.error(f"Search failed: {e}")
                 continue
         
-        # Filter out completed IDs
-        remaining_ids = [id for id in all_ids if id not in self.completed_ids]
-        logger.info(f"Downloading {len(remaining_ids):,} new sequences")
+        # Filter out completed IDs - also check if files exist on disk
+        # This ensures we don't try to download files that already exist
+        verified_completed = set(self.completed_ids)
+        for acc_id in all_ids:
+            if acc_id in verified_completed:
+                continue
+            # Check if file exists in either train or val directory
+            train_file = self.viable_dir / f"{acc_id}.fasta"
+            val_file = self.val_viable_dir / f"{acc_id}.fasta"
+            if train_file.exists() or val_file.exists():
+                verified_completed.add(acc_id)
         
-        # Download sequences
-        sequences = await self._harvest_sequences_async(remaining_ids[:max_sequences])
+        remaining_ids = [id for id in all_ids if id not in verified_completed]
+        self.completed_ids = verified_completed  # Update checkpoint with verified IDs
         
-        # Save viable genomes
-        self._save_viable_genomes(sequences)
+        logger.info("="*70)
+        logger.info("SEARCH SUMMARY")
+        logger.info("="*70)
+        logger.info(f"Total unique sequence IDs found: {len(all_ids):,}")
+        logger.info(f"Already downloaded (verified on disk): {len(verified_completed):,}")
+        logger.info(f"New sequences to download: {len(remaining_ids):,}")
+        logger.info(f"Target: {max_sequences:,} sequences")
+        logger.info("="*70)
+        
+        # Limit to max_sequences if needed
+        if len(remaining_ids) > max_sequences:
+            logger.info(f"Limiting download to {max_sequences:,} sequences (first {max_sequences:,} of {len(remaining_ids):,})")
+            remaining_ids = remaining_ids[:max_sequences]
+        
+        # Download sequences (they are saved immediately during download)
+        sequences = await self._harvest_sequences_async(remaining_ids)
+        
+        # Note: Sequences are already saved to disk during download via _save_sequence_immediate
+        # We don't need to call _save_viable_genomes here since saving happens incrementally
+        logger.info("All sequences have been saved to disk during download.")
         
         return sequences
     
-    @backoff.on_exception(backoff.expo, (aiohttp.ClientError, asyncio.TimeoutError), max_tries=10)
+    @backoff.on_exception(
+        backoff.expo,
+        (aiohttp.ClientError, asyncio.TimeoutError, Exception),
+        max_tries=15,
+        max_time=300,  # 5 minutes max retry time
+        base=2,
+        factor=1.5
+    )
     async def _fetch_batch_async(self, session, batch_ids, batch_num):
-        """Fetch a batch of sequences"""
+        """Fetch a batch of sequences with improved error handling"""
         async with self.semaphore:
             url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
             params = {
@@ -209,62 +277,303 @@ class ViralGenomeHarvester:
             if self.api_key:
                 params['api_key'] = self.api_key
             
-            timeout = aiohttp.ClientTimeout(total=600)
+            # Increased timeout for large batches
+            timeout = aiohttp.ClientTimeout(total=900, connect=60)
             
             try:
-                async with session.get(url, params=params, timeout=timeout) as response:
+                batch_start = time.time()
+                async with session.get(url, params=params, timeout=timeout, ssl=self.ssl_context) as response:
                     if response.status == 200:
                         data = await response.text()
-                        return self._parse_fasta_batch(data, batch_ids)
+                        batch_time = time.time() - batch_start
+                        parsed = self._parse_fasta_batch(data, batch_ids)
+                        logger.debug(f"Batch {batch_num}: Downloaded {len(parsed)} sequences in {batch_time:.2f}s")
+                        return parsed
                     elif response.status == 429:
-                        await asyncio.sleep(60)
-                        raise Exception("HTTP 429")
+                        # Rate limited - wait longer
+                        wait_time = 120  # 2 minutes
+                        logger.warning(f"Batch {batch_num}: Rate limited (429). Waiting {wait_time} seconds...")
+                        await asyncio.sleep(wait_time)
+                        raise aiohttp.ClientResponseError(
+                            request_info=response.request_info,
+                            history=response.history,
+                            status=429
+                        )
+                    elif response.status in [400, 502, 503, 504]:
+                        # Server errors - retry with exponential backoff
+                        wait_time = 30
+                        logger.warning(f"Batch {batch_num}: HTTP {response.status} error. Will retry after {wait_time}s...")
+                        await asyncio.sleep(wait_time)
+                        raise aiohttp.ClientResponseError(
+                            request_info=response.request_info,
+                            history=response.history,
+                            status=response.status
+                        )
                     else:
-                        await asyncio.sleep(10)
-                        raise Exception(f"HTTP {response.status}")
+                        # Other errors
+                        logger.warning(f"Batch {batch_num}: HTTP {response.status} error. Retrying...")
+                        await asyncio.sleep(20)
+                        raise aiohttp.ClientResponseError(
+                            request_info=response.request_info,
+                            history=response.history,
+                            status=response.status
+                        )
+            except (aiohttp.ClientPayloadError, aiohttp.ServerDisconnectedError) as e:
+                # Network errors - retry
+                logger.debug(f"Batch {batch_num}: Network error {type(e).__name__}. Will retry...")
+                await asyncio.sleep(5)
+                raise
             except Exception as e:
-                logger.warning(f"Batch {batch_num} failed: {e}")
+                logger.debug(f"Batch {batch_num} error: {e} (will retry)")
+                await asyncio.sleep(10)
                 raise
     
+    def _save_sequence_immediate(self, seq: Dict[str, Any], is_training: bool = None):
+        """Save a single sequence immediately to disk"""
+        try:
+            acc = seq.get('accession')
+            if not acc:
+                return False
+            
+            # Determine if training or validation (90/10 split based on hash)
+            if is_training is None:
+                # Use hash of accession for consistent split
+                hash_val = int(hashlib.md5(acc.encode()).hexdigest(), 16)
+                is_training = (hash_val % 10) < 9  # 90% training
+            
+            target_dir = self.viable_dir if is_training else self.val_viable_dir
+            filename = f"{acc}.fasta"
+            filepath = target_dir / filename
+            
+            # Skip if already exists
+            if filepath.exists():
+                return True
+            
+            # Save immediately
+            with open(filepath, 'w') as f:
+                f.write(f">{seq['id']} {seq['description']}\n")
+                f.write(seq['sequence'] + '\n')
+            
+            return True
+        except Exception as e:
+            logger.debug(f"Failed to save sequence {seq.get('accession', 'unknown')}: {e}")
+            return False
+    
     async def _harvest_sequences_async(self, id_list, batch_size=200):
-        """Async download of sequences"""
+        """Async download of sequences with immediate saving and retry logic"""
         remaining_ids = [id for id in id_list if id not in self.completed_ids]
+        total_to_download = len(remaining_ids)
         
-        logger.info(f"Downloading {len(remaining_ids)} sequences")
+        logger.info("="*70)
+        logger.info(f"DOWNLOADING VIRAL GENOMES FROM NCBI")
+        logger.info("="*70)
+        logger.info(f"Total sequences to download: {total_to_download:,}")
+        logger.info(f"Batch size: {batch_size} sequences per batch")
+        logger.info(f"Concurrent downloads: {self.max_concurrent}")
+        logger.info(f"Sequences will be saved IMMEDIATELY after each batch")
+        logger.info(f"Starting download...")
+        logger.info("="*70)
         
         connector = TCPConnector(limit=self.max_concurrent, limit_per_host=50, ssl=self.ssl_context)
         sequences = []
+        failed_batches = []
+        failed_batch_ids = {}  # Track which IDs failed in which batch
+        saved_count = 0
+        start_time = time.time()
+        last_checkpoint_time = start_time
+        
+        # Create progress bar with better settings for real-time updates
+        pbar = tqdm(total=total_to_download, desc="Downloading genomes", unit="seq", 
+                   bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]',
+                   miniters=1, mininterval=0.5, file=sys.stdout)
         
         async with aiohttp.ClientSession(connector=connector) as session:
-            tasks = []
+            # Create batch tracking
+            batch_tasks = {}
+            total_batches = (len(remaining_ids) + batch_size - 1) // batch_size
+            logger.info(f"Creating {total_batches} download batches...")
+            sys.stdout.flush()
+            
             for i in range(0, len(remaining_ids), batch_size):
                 batch_ids = remaining_ids[i:i + batch_size]
-                task = self._fetch_batch_async(session, batch_ids, i//batch_size + 1)
-                tasks.append(task)
-                
-                if i > 0 and (i // batch_size) % 10 == 0:
-                    await asyncio.sleep(5)
+                batch_num = i//batch_size + 1
+                task = self._fetch_batch_async(session, batch_ids, batch_num)
+                batch_tasks[task] = (batch_num, batch_ids)
             
-            for future in asyncio.as_completed(tasks):
+            logger.info(f"All batches queued. Starting parallel downloads...")
+            print(f"\n{'='*70}", flush=True)
+            print(f"DOWNLOAD STATUS: Waiting for first batch to complete...", flush=True)
+            print(f"{'='*70}\n", flush=True)
+            sys.stdout.flush()
+            completed_batches = 0
+            last_log_count = 0
+            first_batch_done = False
+            last_update_time = time.time()
+            last_save_time = time.time()
+            
+            # Process completed batches
+            for future in asyncio.as_completed(batch_tasks.keys()):
+                batch_num, batch_ids = batch_tasks[future]
                 try:
                     batch_result = await future
+                    batch_size_actual = len(batch_result)
                     sequences.extend(batch_result)
+                    completed_batches += 1
                     
-                    # Update checkpoint
+                    # Save each sequence immediately to disk (skips if already exists)
+                    batch_saved = 0
+                    batch_existed = 0
                     for seq in batch_result:
                         acc = seq.get('accession')
-                        if acc:
+                        if not acc:
+                            continue
+                        
+                        # Check if already exists before trying to save
+                        target_dir = self.viable_dir if (int(hashlib.md5(acc.encode()).hexdigest(), 16) % 10) < 9 else self.val_viable_dir
+                        filepath = target_dir / f"{acc}.fasta"
+                        
+                        if filepath.exists():
+                            # Already exists - just mark as completed
+                            batch_existed += 1
                             self.completed_ids.add(acc)
+                        else:
+                            # Save new file
+                            if self._save_sequence_immediate(seq):
+                                batch_saved += 1
+                                saved_count += 1
+                                self.completed_ids.add(acc)
                     
-                    if len(sequences) % 1000 == 0:
+                    # Immediate feedback on first batch
+                    if not first_batch_done:
+                        pbar.write(f"\n[STARTED] First batch downloaded! {batch_size_actual} sequences received.")
+                        if batch_saved > 0:
+                            pbar.write(f"[INFO] {batch_saved} new sequences saved, {batch_existed} already existed.")
+                        else:
+                            pbar.write(f"[INFO] All {batch_existed} sequences already existed (skipped saving).")
+                        pbar.write(f"[INFO] Downloads are now in progress. New sequences saved immediately to disk.")
+                        sys.stdout.flush()
+                        first_batch_done = True
+                    
+                    # Update progress bar immediately
+                    pbar.update(batch_size_actual)
+                    pbar.refresh()  # Force refresh
+                    
+                    # Detailed logging every 100 sequences OR every 5 seconds (whichever comes first)
+                    current_time = time.time()
+                    time_since_update = current_time - last_update_time
+                    should_log = (len(sequences) - last_log_count >= 100) or (time_since_update >= 5)
+                    
+                    if should_log:
+                        elapsed = time.time() - start_time
+                        rate = len(sequences) / elapsed if elapsed > 0 else 0
+                        remaining = (total_to_download - len(sequences)) / rate if rate > 0 else 0
+                        
+                        # Write to progress bar (appears above it)
+                        pbar.write(f"\n[PROGRESS] Downloaded: {len(sequences):,}/{total_to_download:,} "
+                                  f"({len(sequences)*100/total_to_download:.2f}%) | "
+                                  f"Saved: {saved_count:,} | "
+                                  f"Rate: {rate:.1f} seq/s | "
+                                  f"ETA: {remaining/60:.1f} min | "
+                                  f"Batches: {completed_batches}/{total_batches}")
+                        sys.stdout.flush()
+                        last_log_count = len(sequences)
+                        last_update_time = current_time
+                    
+                    # Save checkpoint every 100 sequences or every 30 seconds (more frequent)
+                    current_time = time.time()
+                    if (saved_count % 100 == 0 and saved_count > 0) or (current_time - last_checkpoint_time > 30):
                         self._save_checkpoint()
-                        logger.info(f"Downloaded {len(sequences)} sequences")
+                        last_checkpoint_time = current_time
+                        if current_time - last_save_time > 60:  # Only log every minute
+                            pbar.write(f"[CHECKPOINT] Saved progress: {saved_count:,} sequences saved to disk")
+                            sys.stdout.flush()
+                            last_save_time = current_time
                 
                 except Exception as e:
-                    logger.warning(f"Batch failed: {e}")
+                    # Track failed batch for retry
+                    failed_batches.append((batch_num, batch_ids, str(e)))
+                    failed_batch_ids[batch_num] = batch_ids
+                    pbar.write(f"[WARNING] Batch {batch_num} failed: {e}. Will retry later.")
+                    sys.stdout.flush()
                     continue
         
+        # Retry failed batches with exponential backoff (session still open)
+        if failed_batches:
+            logger.info("="*70)
+            logger.info(f"RETRYING {len(failed_batches)} FAILED BATCHES")
+            logger.info("="*70)
+            pbar.write(f"\n[RETRY] Retrying {len(failed_batches)} failed batches...")
+            sys.stdout.flush()
+            
+            for retry_round in range(3):  # Up to 3 retry rounds
+                if not failed_batches:
+                    break
+                
+                logger.info(f"Retry round {retry_round + 1}/3: {len(failed_batches)} batches remaining")
+                pbar.write(f"[RETRY] Round {retry_round + 1}: Retrying {len(failed_batches)} batches...")
+                sys.stdout.flush()
+                
+                # Wait before retry (except first round)
+                if retry_round > 0:
+                    wait_time = 60 * (retry_round + 1)  # 2 min, 3 min
+                    logger.info(f"Waiting {wait_time} seconds before retry...")
+                    await asyncio.sleep(wait_time)
+                
+                retry_tasks = {}
+                remaining_failed = []
+                
+                for batch_num, batch_ids, error_msg in failed_batches:
+                    # Filter out IDs that were already downloaded
+                    remaining_batch_ids = [id for id in batch_ids if id not in self.completed_ids]
+                    if not remaining_batch_ids:
+                        continue  # All IDs in this batch were already downloaded
+                    
+                    task = self._fetch_batch_async(session, remaining_batch_ids, f"R{batch_num}")
+                    retry_tasks[task] = (batch_num, remaining_batch_ids)
+                
+                # Process retry batches
+                if retry_tasks:
+                    for future in asyncio.as_completed(retry_tasks.keys()):
+                        batch_num, batch_ids = retry_tasks[future]
+                        try:
+                            batch_result = await future
+                            batch_saved = 0
+                            for seq in batch_result:
+                                if self._save_sequence_immediate(seq):
+                                    batch_saved += 1
+                                    saved_count += 1
+                                    acc = seq.get('accession')
+                                    if acc:
+                                        self.completed_ids.add(acc)
+                            sequences.extend(batch_result)
+                            pbar.update(len(batch_result))
+                            pbar.write(f"[SUCCESS] Batch {batch_num} retry successful: {batch_saved} sequences saved")
+                            sys.stdout.flush()
+                            self._save_checkpoint()
+                        except Exception as e:
+                            remaining_failed.append((batch_num, batch_ids, str(e)))
+                            pbar.write(f"[WARNING] Batch {batch_num} retry failed: {e}")
+                            sys.stdout.flush()
+                
+                failed_batches = remaining_failed
+        
+        pbar.close()
         self._save_checkpoint()
+        
+        elapsed_total = time.time() - start_time
+        rate_avg = saved_count / elapsed_total if elapsed_total > 0 else 0
+        
+        logger.info("="*70)
+        logger.info(f"DOWNLOAD COMPLETE!")
+        logger.info(f"Successfully downloaded: {len(sequences):,} sequences")
+        logger.info(f"Saved to disk: {saved_count:,} sequences")
+        logger.info(f"Failed batches (after retries): {len(failed_batches)}")
+        if failed_batches:
+            logger.warning(f"Some batches failed after retries. Run again to retry failed IDs.")
+        logger.info(f"Total time: {elapsed_total/60:.2f} minutes")
+        logger.info(f"Average rate: {rate_avg:.2f} sequences/second")
+        logger.info("="*70)
+        
         return sequences
     
     def _parse_fasta_batch(self, fasta_data, batch_ids):
@@ -289,7 +598,10 @@ class ViralGenomeHarvester:
     
     def _save_viable_genomes(self, sequences):
         """Save viable genomes to training directories"""
-        logger.info(f"Saving {len(sequences)} viable genomes")
+        logger.info("="*70)
+        logger.info(f"SAVING VIABLE GENOMES TO DISK")
+        logger.info("="*70)
+        logger.info(f"Total sequences to save: {len(sequences):,}")
         
         # Split into train/val (90/10)
         random.shuffle(sequences)
@@ -297,58 +609,124 @@ class ViralGenomeHarvester:
         train_sequences = sequences[:split_idx]
         val_sequences = sequences[split_idx:]
         
-        # Save training data
+        logger.info(f"Split: {len(train_sequences):,} training (90%) | {len(val_sequences):,} validation (10%)")
+        logger.info(f"Saving training sequences to: {self.viable_dir}")
+        
+        # Save training data with progress bar
+        pbar_train = tqdm(total=len(train_sequences), desc="Saving training genomes", unit="seq")
         for i, seq in enumerate(train_sequences):
             filename = f"{seq['accession']}.fasta"
             filepath = self.viable_dir / filename
             with open(filepath, 'w') as f:
                 f.write(f">{seq['id']} {seq['description']}\n")
                 f.write(seq['sequence'] + '\n')
+            pbar_train.update(1)
+            if (i + 1) % 1000 == 0:
+                logger.info(f"  Saved {i + 1:,}/{len(train_sequences):,} training sequences")
+        pbar_train.close()
         
-        # Save validation data
+        # Save validation data with progress bar
+        logger.info(f"Saving validation sequences to: {self.val_viable_dir}")
+        pbar_val = tqdm(total=len(val_sequences), desc="Saving validation genomes", unit="seq")
         for i, seq in enumerate(val_sequences):
             filename = f"{seq['accession']}.fasta"
             filepath = self.val_viable_dir / filename
             with open(filepath, 'w') as f:
                 f.write(f">{seq['id']} {seq['description']}\n")
                 f.write(seq['sequence'] + '\n')
+            pbar_val.update(1)
+            if (i + 1) % 500 == 0:
+                logger.info(f"  Saved {i + 1:,}/{len(val_sequences):,} validation sequences")
+        pbar_val.close()
         
-        logger.info(f"Saved {len(train_sequences)} training and {len(val_sequences)} validation viable genomes")
+        logger.info("="*70)
+        logger.info(f"[SUCCESS] Saved {len(train_sequences):,} training and {len(val_sequences):,} validation viable genomes")
+        logger.info("="*70)
     
     def generate_non_viable_genomes(self, count=10000, methods=['random', 'fragmented', 'no_start', 'no_stop', 'invalid_codons']):
         """Generate non-viable genomes for training"""
-        logger.info(f"Generating {count} non-viable genomes using methods: {methods}")
+        logger.info("="*70)
+        logger.info(f"GENERATING SYNTHETIC NON-VIABLE GENOMES")
+        logger.info("="*70)
+        logger.info(f"Total to generate: {count:,}")
+        logger.info(f"Generation methods: {', '.join(methods)}")
+        logger.info("="*70)
+        logger.info("NOTE: Non-viable viruses are NOT downloaded from NCBI.")
+        logger.info("      They are generated synthetically using various methods")
+        logger.info("      to create sequences that cannot form viable viruses.")
+        logger.info("="*70)
         
         non_viable_sequences = []
+        method_counts = {method: 0 for method in methods}
+        start_time = time.time()
+        
+        # Generate sequences with progress bar
+        pbar = tqdm(total=count, desc="Generating non-viable genomes", unit="seq",
+                   bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
         
         for i in range(count):
             method = random.choice(methods)
+            method_counts[method] += 1
             seq = self._generate_non_viable_sequence(method, i)
             non_viable_sequences.append(seq)
+            pbar.update(1)
+            
+            if (i + 1) % 5000 == 0:
+                elapsed = time.time() - start_time
+                rate = (i + 1) / elapsed if elapsed > 0 else 0
+                pbar.write(f"[PROGRESS] Generated {i + 1:,}/{count:,} ({i*100/count:.1f}%) | "
+                          f"Rate: {rate:.1f} seq/s")
+        
+        pbar.close()
+        
+        # Log method distribution
+        logger.info("="*70)
+        logger.info("Generation method distribution:")
+        for method, count_method in method_counts.items():
+            percentage = (count_method / count) * 100
+            logger.info(f"  {method}: {count_method:,} ({percentage:.1f}%)")
+        logger.info("="*70)
         
         # Split into train/val
+        logger.info("Splitting into training (90%) and validation (10%) sets...")
         random.shuffle(non_viable_sequences)
         split_idx = int(len(non_viable_sequences) * 0.9)
         train_sequences = non_viable_sequences[:split_idx]
         val_sequences = non_viable_sequences[split_idx:]
         
-        # Save training data
-        for seq in train_sequences:
+        logger.info(f"Saving {len(train_sequences):,} training sequences to: {self.non_viable_dir}")
+        # Save training data with progress bar
+        pbar_save = tqdm(total=len(train_sequences), desc="Saving training non-viable", unit="seq")
+        for i, seq in enumerate(train_sequences):
             filename = f"non_viable_{seq['id']}.fasta"
             filepath = self.non_viable_dir / filename
             with open(filepath, 'w') as f:
                 f.write(f">{seq['id']} {seq['description']}\n")
                 f.write(seq['sequence'] + '\n')
+            pbar_save.update(1)
+            if (i + 1) % 5000 == 0:
+                logger.info(f"  Saved {i + 1:,}/{len(train_sequences):,} training sequences")
+        pbar_save.close()
         
-        # Save validation data
-        for seq in val_sequences:
+        logger.info(f"Saving {len(val_sequences):,} validation sequences to: {self.val_non_viable_dir}")
+        # Save validation data with progress bar
+        pbar_save_val = tqdm(total=len(val_sequences), desc="Saving validation non-viable", unit="seq")
+        for i, seq in enumerate(val_sequences):
             filename = f"non_viable_{seq['id']}.fasta"
             filepath = self.val_non_viable_dir / filename
             with open(filepath, 'w') as f:
                 f.write(f">{seq['id']} {seq['description']}\n")
                 f.write(seq['sequence'] + '\n')
+            pbar_save_val.update(1)
+            if (i + 1) % 2000 == 0:
+                logger.info(f"  Saved {i + 1:,}/{len(val_sequences):,} validation sequences")
+        pbar_save_val.close()
         
-        logger.info(f"Generated {len(train_sequences)} training and {len(val_sequences)} validation non-viable genomes")
+        elapsed_total = time.time() - start_time
+        logger.info("="*70)
+        logger.info(f"[SUCCESS] Generated {len(train_sequences):,} training and {len(val_sequences):,} validation non-viable genomes")
+        logger.info(f"Total time: {elapsed_total:.2f} seconds ({elapsed_total/60:.2f} minutes)")
+        logger.info("="*70)
         return non_viable_sequences
     
     def _generate_non_viable_sequence(self, method: str, index: int) -> Dict[str, Any]:
@@ -433,9 +811,29 @@ class ViralGenomeHarvester:
     
     def generate_from_viable(self, viable_sequences: List[Dict[str, Any]], count: int):
         """Generate non-viable genomes by mutating viable ones"""
-        logger.info(f"Generating {count} non-viable genomes from {len(viable_sequences)} viable genomes")
+        logger.info("="*70)
+        logger.info(f"GENERATING MUTATED NON-VIABLE GENOMES")
+        logger.info("="*70)
+        logger.info(f"Total to generate: {count:,}")
+        logger.info(f"Source: {len(viable_sequences):,} viable genomes")
+        logger.info("="*70)
+        logger.info("NOTE: These are generated by mutating viable genomes to make them non-viable.")
+        logger.info("      Mutations include: deleting start codons, inserting premature stops,")
+        logger.info("      frame shifts, and random corruption.")
+        logger.info("="*70)
+        
+        if not viable_sequences:
+            logger.warning("No viable sequences available for mutation!")
+            return []
         
         non_viable = []
+        mutation_types = ['delete_start', 'insert_stop', 'frame_shift', 'corrupt']
+        mutation_counts = {mut: 0 for mut in mutation_types}
+        start_time = time.time()
+        
+        # Generate with progress bar
+        pbar = tqdm(total=count, desc="Mutating viable genomes", unit="seq",
+                   bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
         
         for i in range(count):
             # Pick a random viable sequence
@@ -443,7 +841,8 @@ class ViralGenomeHarvester:
             seq = source['sequence']
             
             # Apply mutations to make it non-viable
-            mutation_type = random.choice(['delete_start', 'insert_stop', 'frame_shift', 'corrupt'])
+            mutation_type = random.choice(mutation_types)
+            mutation_counts[mutation_type] += 1
             
             if mutation_type == 'delete_start':
                 # Remove all start codons
@@ -491,28 +890,62 @@ class ViralGenomeHarvester:
                 'non_viable_method': mutation_type,
                 'source_accession': source['accession']
             })
+            
+            pbar.update(1)
+            if (i + 1) % 5000 == 0:
+                elapsed = time.time() - start_time
+                rate = (i + 1) / elapsed if elapsed > 0 else 0
+                pbar.write(f"[PROGRESS] Generated {i + 1:,}/{count:,} ({i*100/count:.1f}%) | "
+                          f"Rate: {rate:.1f} seq/s")
+        
+        pbar.close()
+        
+        # Log mutation distribution
+        logger.info("="*70)
+        logger.info("Mutation type distribution:")
+        for mut_type, count_mut in mutation_counts.items():
+            percentage = (count_mut / count) * 100
+            logger.info(f"  {mut_type}: {count_mut:,} ({percentage:.1f}%)")
+        logger.info("="*70)
         
         # Save
+        logger.info("Splitting into training (90%) and validation (10%) sets...")
         random.shuffle(non_viable)
         split_idx = int(len(non_viable) * 0.9)
         train_sequences = non_viable[:split_idx]
         val_sequences = non_viable[split_idx:]
         
-        for seq in train_sequences:
+        logger.info(f"Saving {len(train_sequences):,} training sequences...")
+        pbar_save = tqdm(total=len(train_sequences), desc="Saving mutated training", unit="seq")
+        for i, seq in enumerate(train_sequences):
             filename = f"non_viable_{seq['accession']}.fasta"
             filepath = self.non_viable_dir / filename
             with open(filepath, 'w') as f:
                 f.write(f">{seq['id']} {seq['description']}\n")
                 f.write(seq['sequence'] + '\n')
+            pbar_save.update(1)
+            if (i + 1) % 2000 == 0:
+                logger.info(f"  Saved {i + 1:,}/{len(train_sequences):,} training sequences")
+        pbar_save.close()
         
-        for seq in val_sequences:
+        logger.info(f"Saving {len(val_sequences):,} validation sequences...")
+        pbar_save_val = tqdm(total=len(val_sequences), desc="Saving mutated validation", unit="seq")
+        for i, seq in enumerate(val_sequences):
             filename = f"non_viable_{seq['accession']}.fasta"
             filepath = self.val_non_viable_dir / filename
             with open(filepath, 'w') as f:
                 f.write(f">{seq['id']} {seq['description']}\n")
                 f.write(seq['sequence'] + '\n')
+            pbar_save_val.update(1)
+            if (i + 1) % 1000 == 0:
+                logger.info(f"  Saved {i + 1:,}/{len(val_sequences):,} validation sequences")
+        pbar_save_val.close()
         
-        logger.info(f"Generated {len(train_sequences)} training and {len(val_sequences)} validation mutated non-viable genomes")
+        elapsed_total = time.time() - start_time
+        logger.info("="*70)
+        logger.info(f"[SUCCESS] Generated {len(train_sequences):,} training and {len(val_sequences):,} validation mutated non-viable genomes")
+        logger.info(f"Total time: {elapsed_total:.2f} seconds ({elapsed_total/60:.2f} minutes)")
+        logger.info("="*70)
         return non_viable
 
 async def main():

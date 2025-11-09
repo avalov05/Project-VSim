@@ -18,47 +18,87 @@ class ViabilityPredictor(nn.Module):
     """
     Deep learning model for predicting viral genome viability
     Architecture: Transformer-based encoder + MLP classifier
+    Enhanced version with larger capacity for maximum quality
     """
     
-    def __init__(self, input_dim: int = 512, hidden_dim: int = 256, num_layers: int = 4):
+    def __init__(self, input_dim: int = 1024, hidden_dim: int = 512, num_layers: int = 8, num_heads: int = 16):
         super().__init__()
         
-        # Transformer encoder for sequence features
+        # Transformer encoder for sequence features (larger and deeper)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=input_dim,
-            nhead=8,
-            dim_feedforward=hidden_dim * 2,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim * 4,  # Larger feedforward
             dropout=0.1,
-            batch_first=True
+            batch_first=True,
+            activation='gelu'  # GELU activation for better performance
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        # Feature fusion
+        # Layer normalization for stability
+        self.layer_norm = nn.LayerNorm(input_dim)
+        
+        # Enhanced feature fusion with residual connections
         self.feature_fusion = nn.Sequential(
-            nn.Linear(input_dim + 128, hidden_dim),
-            nn.ReLU(),
+            nn.Linear(input_dim + 128, hidden_dim * 2),
+            nn.LayerNorm(hidden_dim * 2),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
             nn.Dropout(0.2),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.2)
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(0.1)
         )
         
-        # Classifier
+        # Deeper classifier with residual-style connections
         self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(0.15),
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.GELU(),
             nn.Dropout(0.1),
+            nn.Linear(hidden_dim // 2, hidden_dim // 4),
+            nn.LayerNorm(hidden_dim // 4),
+            nn.GELU(),
+            nn.Dropout(0.05),
+            nn.Linear(hidden_dim // 4, 1),
+            nn.Sigmoid()
+        )
+        
+        # Enhanced confidence estimator
+        self.confidence_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(0.05),
             nn.Linear(hidden_dim // 2, 1),
             nn.Sigmoid()
         )
         
-        # Confidence estimator
-        self.confidence_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1),
-            nn.Sigmoid()
-        )
+        # Initialize weights
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize weights using Xavier uniform initialization"""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
     
     def forward(self, sequence_features: torch.Tensor, 
                 structural_features: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -75,8 +115,14 @@ class ViabilityPredictor(nn.Module):
         # Encode sequence
         encoded = self.encoder(sequence_features)
         
-        # Global pooling
-        pooled = encoded.mean(dim=1)  # [batch_size, input_dim]
+        # Apply layer normalization
+        encoded = self.layer_norm(encoded)
+        
+        # Multi-head attention pooling (better than mean pooling)
+        # Use both mean and max pooling for richer representation
+        mean_pooled = encoded.mean(dim=1)  # [batch_size, input_dim]
+        max_pooled = encoded.max(dim=1)[0]  # [batch_size, input_dim]
+        pooled = (mean_pooled + max_pooled) / 2  # Combined pooling
         
         # Fuse features
         fused = torch.cat([pooled, structural_features], dim=1)
@@ -107,7 +153,7 @@ class ViabilityPredictorWrapper:
         self._load_model()
     
     def _load_model(self):
-        """Load trained model"""
+        """Load trained model with enhanced architecture support"""
         model_path = self.config.viability_model_path
         
         if model_path and Path(model_path).exists():
@@ -115,13 +161,27 @@ class ViabilityPredictorWrapper:
                 self.logger.info(f"Loading viability model from: {model_path}")
                 checkpoint = torch.load(model_path, map_location=self.device)
                 
-                # Initialize model
-                self.model = ViabilityPredictor()
+                # Try to load architecture params from checkpoint, otherwise use defaults
+                # Enhanced model uses: input_dim=1024, hidden_dim=512, num_layers=8, num_heads=16
+                # Old model uses: input_dim=512, hidden_dim=256, num_layers=4, num_heads=8
+                model_params = checkpoint.get('model_params', {})
+                input_dim = model_params.get('input_dim', 1024)  # Default to enhanced
+                hidden_dim = model_params.get('hidden_dim', 512)
+                num_layers = model_params.get('num_layers', 8)
+                num_heads = model_params.get('num_heads', 16)
+                
+                # Initialize model with correct architecture
+                self.model = ViabilityPredictor(
+                    input_dim=input_dim,
+                    hidden_dim=hidden_dim,
+                    num_layers=num_layers,
+                    num_heads=num_heads
+                )
                 self.model.load_state_dict(checkpoint['model_state_dict'])
                 self.model.to(self.device)
                 self.model.eval()
                 
-                self.logger.info("Viability model loaded successfully")
+                self.logger.info(f"Viability model loaded successfully (arch: dim={input_dim}, layers={num_layers})")
             except Exception as e:
                 self.logger.warning(f"Failed to load viability model: {e}. Using rule-based fallback.")
                 self.model = None

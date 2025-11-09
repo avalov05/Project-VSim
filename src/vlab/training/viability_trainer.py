@@ -7,15 +7,38 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import logging
 import json
+import numpy as np
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from torch.cuda.amp import GradScaler, autocast
 
 from ..viability.predictor import ViabilityPredictor
 from ..viability.features import FeatureExtractor
 from ..core.config import VLabConfig
 
 logger = logging.getLogger(__name__)
+
+class FocalLoss(nn.Module):
+    """Focal Loss for handling class imbalance"""
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+    
+    def forward(self, inputs, targets):
+        bce_loss = nn.functional.binary_cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-bce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
 
 class ViabilityDataset(Dataset):
     """Dataset for viability prediction"""
@@ -42,97 +65,263 @@ class ViabilityDataset(Dataset):
         }
 
 class ViabilityTrainer:
-    """Train viability prediction model"""
+    """Train viability prediction model with advanced features for maximum quality"""
     
-    def __init__(self, config: VLabConfig):
+    def __init__(self, config: VLabConfig, 
+                 input_dim: int = 1024, 
+                 hidden_dim: int = 512, 
+                 num_layers: int = 8,
+                 num_heads: int = 16,
+                 use_focal_loss: bool = True,
+                 use_mixed_precision: bool = True):
         self.config = config
         self.device = torch.device(f"cuda:{config.gpu_id}" if config.use_gpu and torch.cuda.is_available() else "cpu")
-        self.model = ViabilityPredictor().to(self.device)
+        self.use_mixed_precision = use_mixed_precision and torch.cuda.is_available()
+        self.scaler = GradScaler() if self.use_mixed_precision else None
+        
+        # Enhanced model architecture
+        self.model = ViabilityPredictor(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            num_heads=num_heads
+        ).to(self.device)
+        
         self.feature_extractor = FeatureExtractor(config)
+        self.use_focal_loss = use_focal_loss
+        
+        # Store architecture parameters for saving
+        self.model_params = {
+            'input_dim': input_dim,
+            'hidden_dim': hidden_dim,
+            'num_layers': num_layers,
+            'num_heads': num_heads
+        }
+        
+        # Training history
+        self.train_history = {
+            'loss': [],
+            'accuracy': [],
+            'f1': [],
+            'auc': []
+        }
+        self.val_history = {
+            'loss': [],
+            'accuracy': [],
+            'f1': [],
+            'auc': []
+        }
     
     def train(self, train_annotations: List[Dict[str, Any]], 
              train_labels: List[float],
              val_annotations: List[Dict[str, Any]] = None,
              val_labels: List[float] = None,
-             epochs: int = 50,
+             epochs: int = 100,
              batch_size: int = 32,
-             learning_rate: float = 1e-4):
-        """Train the model"""
-        logger.info("Starting training...")
+             learning_rate: float = 1e-4,
+             weight_decay: float = 1e-5,
+             warmup_epochs: int = 5,
+             early_stopping_patience: int = 15,
+             gradient_clip_val: float = 1.0):
+        """Train the model with advanced features for maximum quality"""
+        logger.info("Starting training with enhanced configuration...")
+        logger.info(f"Model architecture: input_dim=1024, hidden_dim=512, num_layers=8, num_heads=16")
+        logger.info(f"Training settings: epochs={epochs}, batch_size={batch_size}, lr={learning_rate}")
+        logger.info(f"Advanced features: focal_loss={self.use_focal_loss}, mixed_precision={self.use_mixed_precision}")
         
         # Create datasets
         train_dataset = ViabilityDataset(train_annotations, train_labels)
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=batch_size, 
+            shuffle=True,
+            num_workers=2,
+            pin_memory=True if torch.cuda.is_available() else False
+        )
         
         if val_annotations:
             val_dataset = ViabilityDataset(val_annotations, val_labels)
-            val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+            val_loader = DataLoader(
+                val_dataset, 
+                batch_size=batch_size, 
+                shuffle=False,
+                num_workers=2,
+                pin_memory=True if torch.cuda.is_available() else False
+            )
         else:
             val_loader = None
         
-        # Loss and optimizer
-        criterion = nn.BCELoss()
-        optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5)
+        # Loss function
+        if self.use_focal_loss:
+            criterion = FocalLoss(alpha=0.25, gamma=2.0)
+        else:
+            criterion = nn.BCELoss()
         
+        # Optimizer with weight decay
+        optimizer = optim.AdamW(
+            self.model.parameters(), 
+            lr=learning_rate,
+            weight_decay=weight_decay,
+            betas=(0.9, 0.999),
+            eps=1e-8
+        )
+        
+        # Learning rate scheduler with warmup and cosine annealing
+        def lr_lambda(epoch):
+            if epoch < warmup_epochs:
+                return (epoch + 1) / warmup_epochs
+            else:
+                return 0.5 * (1 + np.cos(np.pi * (epoch - warmup_epochs) / (epochs - warmup_epochs)))
+        
+        scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        
+        # Early stopping
         best_val_loss = float('inf')
+        best_val_auc = 0.0
+        patience_counter = 0
+        no_improvement_epochs = 0
         
         for epoch in range(epochs):
-            # Training
+            # Training phase
             self.model.train()
             train_loss = 0.0
+            train_preds = []
+            train_targets = []
             
             for batch in train_loader:
-                sequence_features = batch['sequence_features'].to(self.device)
-                structural_features = batch['structural_features'].to(self.device)
-                labels = batch['label'].to(self.device)
+                sequence_features = batch['sequence_features'].to(self.device, non_blocking=True)
+                structural_features = batch['structural_features'].to(self.device, non_blocking=True)
+                labels = batch['label'].to(self.device, non_blocking=True)
                 
                 optimizer.zero_grad()
-                outputs = self.model(sequence_features, structural_features)
-                loss = criterion(outputs['viability'], labels)
-                loss.backward()
-                optimizer.step()
+                
+                if self.use_mixed_precision:
+                    with autocast():
+                        outputs = self.model(sequence_features, structural_features)
+                        loss = criterion(outputs['viability'], labels)
+                    
+                    self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), gradient_clip_val)
+                    self.scaler.step(optimizer)
+                    self.scaler.update()
+                else:
+                    outputs = self.model(sequence_features, structural_features)
+                    loss = criterion(outputs['viability'], labels)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), gradient_clip_val)
+                    optimizer.step()
                 
                 train_loss += loss.item()
+                train_preds.extend(outputs['viability'].detach().cpu().numpy())
+                train_targets.extend(labels.cpu().numpy())
             
             train_loss /= len(train_loader)
+            train_preds = np.array(train_preds)
+            train_targets = np.array(train_targets)
+            train_preds_binary = (train_preds > 0.5).astype(int)
             
-            # Validation
+            # Calculate metrics
+            train_acc = accuracy_score(train_targets, train_preds_binary)
+            train_f1 = f1_score(train_targets, train_preds_binary, zero_division=0)
+            train_auc = roc_auc_score(train_targets, train_preds) if len(np.unique(train_targets)) > 1 else 0.0
+            
+            self.train_history['loss'].append(train_loss)
+            self.train_history['accuracy'].append(train_acc)
+            self.train_history['f1'].append(train_f1)
+            self.train_history['auc'].append(train_auc)
+            
+            # Update learning rate
+            scheduler.step()
+            current_lr = optimizer.param_groups[0]['lr']
+            
+            # Validation phase
             if val_loader:
                 self.model.eval()
                 val_loss = 0.0
+                val_preds = []
+                val_targets = []
                 
                 with torch.no_grad():
                     for batch in val_loader:
-                        sequence_features = batch['sequence_features'].to(self.device)
-                        structural_features = batch['structural_features'].to(self.device)
-                        labels = batch['label'].to(self.device)
+                        sequence_features = batch['sequence_features'].to(self.device, non_blocking=True)
+                        structural_features = batch['structural_features'].to(self.device, non_blocking=True)
+                        labels = batch['label'].to(self.device, non_blocking=True)
                         
-                        outputs = self.model(sequence_features, structural_features)
-                        loss = criterion(outputs['viability'], labels)
+                        if self.use_mixed_precision:
+                            with autocast():
+                                outputs = self.model(sequence_features, structural_features)
+                                loss = criterion(outputs['viability'], labels)
+                        else:
+                            outputs = self.model(sequence_features, structural_features)
+                            loss = criterion(outputs['viability'], labels)
+                        
                         val_loss += loss.item()
+                        val_preds.extend(outputs['viability'].cpu().numpy())
+                        val_targets.extend(labels.cpu().numpy())
                 
                 val_loss /= len(val_loader)
-                scheduler.step(val_loss)
+                val_preds = np.array(val_preds)
+                val_targets = np.array(val_targets)
+                val_preds_binary = (val_preds > 0.5).astype(int)
                 
-                logger.info(f"Epoch {epoch+1}/{epochs}: Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+                # Calculate metrics
+                val_acc = accuracy_score(val_targets, val_preds_binary)
+                val_precision = precision_score(val_targets, val_preds_binary, zero_division=0)
+                val_recall = recall_score(val_targets, val_preds_binary, zero_division=0)
+                val_f1 = f1_score(val_targets, val_preds_binary, zero_division=0)
+                val_auc = roc_auc_score(val_targets, val_preds) if len(np.unique(val_targets)) > 1 else 0.0
                 
-                # Save best model
-                if val_loss < best_val_loss:
+                self.val_history['loss'].append(val_loss)
+                self.val_history['accuracy'].append(val_acc)
+                self.val_history['f1'].append(val_f1)
+                self.val_history['auc'].append(val_auc)
+                
+                # Log metrics
+                logger.info(
+                    f"Epoch {epoch+1}/{epochs} | LR: {current_lr:.2e} | "
+                    f"Train: Loss={train_loss:.4f}, Acc={train_acc:.4f}, F1={train_f1:.4f}, AUC={train_auc:.4f} | "
+                    f"Val: Loss={val_loss:.4f}, Acc={val_acc:.4f}, F1={val_f1:.4f}, AUC={val_auc:.4f}, "
+                    f"P={val_precision:.4f}, R={val_recall:.4f}"
+                )
+                
+                # Save best model based on validation AUC (better metric than loss)
+                if val_auc > best_val_auc:
+                    best_val_auc = val_auc
                     best_val_loss = val_loss
                     self.save_model(self.config.models_dir / "viability_model_best.pth")
+                    patience_counter = 0
+                    logger.info(f"  → New best model saved! (AUC: {val_auc:.4f})")
+                else:
+                    patience_counter += 1
+                    no_improvement_epochs += 1
+                
+                # Early stopping
+                if early_stopping_patience > 0 and no_improvement_epochs >= early_stopping_patience:
+                    logger.info(f"Early stopping triggered after {epoch+1} epochs (no improvement for {no_improvement_epochs} epochs)")
+                    break
             else:
-                logger.info(f"Epoch {epoch+1}/{epochs}: Train Loss: {train_loss:.4f}")
+                logger.info(
+                    f"Epoch {epoch+1}/{epochs} | LR: {current_lr:.2e} | "
+                    f"Train: Loss={train_loss:.4f}, Acc={train_acc:.4f}, F1={train_f1:.4f}, AUC={train_auc:.4f}"
+                )
         
         logger.info("Training complete!")
+        if val_loader:
+            logger.info(f"Best validation AUC: {best_val_auc:.4f}")
+            logger.info(f"Best validation loss: {best_val_loss:.4f}")
+        
         return self.model
     
     def save_model(self, path: Path):
-        """Save model"""
+        """Save model with architecture parameters"""
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save({
             'model_state_dict': self.model.state_dict(),
-            'model_class': 'ViabilityPredictor'
+            'model_class': 'ViabilityPredictor',
+            'model_params': self.model_params,
+            'train_history': self.train_history,
+            'val_history': self.val_history
         }, path)
         logger.info(f"Model saved to: {path}")
     
@@ -232,9 +421,9 @@ def main():
     
     args = parser.parse_args()
     
-    # Setup
-    setup_logger(level=logging.INFO)
-    config = VLabConfig.from_file(Path(args.config))
+    # Setup logging
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    config = VLabConfig.from_file(Path(args.config)) if Path(args.config).exists() else VLabConfig()
     
     # Collect data
     data_dir = Path(args.data_dir)

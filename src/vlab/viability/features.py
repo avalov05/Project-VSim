@@ -36,14 +36,15 @@ class FeatureExtractor:
         }
     
     def _extract_sequence_features(self, annotation: Dict[str, Any]) -> np.ndarray:
-        """Extract sequence-level features"""
+        """Extract sequence-level features (enhanced for larger model)"""
         genome = annotation.get('genome_sequence', '')
         
         if not genome:
-            return np.zeros((100, 512))  # Default empty features
+            return np.zeros((100, 1024))  # Default empty features (increased to 1024)
         
-        # K-mer frequencies
-        kmer_features = self._kmer_features(genome, k=3, max_len=100)
+        # Enhanced K-mer frequencies (multiple k values for richer features)
+        kmer_features_3 = self._kmer_features(genome, k=3, max_len=100)
+        kmer_features_4 = self._kmer_features(genome, k=4, max_len=100)
         
         # Nucleotide composition
         comp_features = self._composition_features(genome)
@@ -53,14 +54,15 @@ class FeatureExtractor:
         
         # Combine features
         features = np.concatenate([
-            kmer_features,
+            kmer_features_3,
+            kmer_features_4,
             comp_features,
             codon_features
         ], axis=1)
         
-        # Pad or truncate to fixed size
+        # Pad or truncate to fixed size (increased dimensions)
         target_len = 100
-        target_dim = 512
+        target_dim = 1024  # Increased from 512 to 1024
         
         if features.shape[0] > target_len:
             features = features[:target_len]

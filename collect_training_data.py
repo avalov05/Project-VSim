@@ -54,21 +54,30 @@ Examples:
     
     args = parser.parse_args()
     
-    # Setup logging
+    # Create logs directory (before logging setup)
+    Path('logs').mkdir(exist_ok=True)
+    
+    # Setup logging with unbuffered output
     log_level = logging.DEBUG if args.verbose else logging.INFO
+    # Create stream handler with unbuffered output
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setLevel(log_level)
+    stream_handler.setStream(sys.stdout)
+    
+    file_handler = logging.FileHandler('logs/data_collection.log')
+    file_handler.setLevel(log_level)
+    
     logging.basicConfig(
         level=log_level,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler('logs/data_collection.log')
-        ]
+        handlers=[stream_handler, file_handler],
+        force=True  # Override any existing config
     )
     
-    logger = logging.getLogger(__name__)
+    # Ensure unbuffered output
+    sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, 'reconfigure') else None
     
-    # Create logs directory
-    Path('logs').mkdir(exist_ok=True)
+    logger = logging.getLogger(__name__)
     
     # Check email
     if args.email == "vlab@example.com":
@@ -79,11 +88,11 @@ Examples:
     logger.info("VIRTUAL IN SILICO VIRUS LABORATORY - DATA COLLECTION")
     logger.info("="*70)
     logger.info(f"Email: {args.email}")
-    logger.info(f"API Key: {'✓ Provided' if args.api_key else '✗ Not provided'}")
+    logger.info(f"API Key: {'Provided' if args.api_key else 'Not provided'}")
     logger.info(f"Target Total: {args.total_target:,} genomes")
-    logger.info(f"Max viable genomes: {args.max_viable:,}")
-    logger.info(f"Synthetic non-viable: {args.num_synthetic:,}")
-    logger.info(f"Mutated non-viable: {args.num_mutated:,}")
+    logger.info(f"Max viable genomes: {args.max_viable if args.max_viable is not None else 'Auto-calculated'}")
+    logger.info(f"Synthetic non-viable: {args.num_synthetic if args.num_synthetic is not None else 'Auto-calculated'}")
+    logger.info(f"Mutated non-viable: {args.num_mutated if args.num_mutated is not None else 'Auto-calculated'}")
     logger.info("="*70)
     
     try:
@@ -117,9 +126,9 @@ Examples:
         if results.get('target'):
             print(f"Target: {results['target']:,} genomes")
             if results.get('reached_target'):
-                print("✓ Target reached!")
+                print("[SUCCESS] Target reached!")
             else:
-                print(f"⚠ Target not reached (collected {results['total']:,} of {results['target']:,})")
+                print(f"[WARNING] Target not reached (collected {results['total']:,} of {results['target']:,})")
         print(f"\nData location: data/training/")
         print("="*70)
         print("\nNext steps:")

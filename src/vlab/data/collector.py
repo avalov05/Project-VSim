@@ -73,11 +73,25 @@ class DataCollector:
         logger.info("="*70)
         logger.info("STEP 1: Harvesting viable viral genomes from NCBI")
         logger.info("="*70)
+        logger.info("This will download real viral genomes from the NCBI nucleotide database.")
+        logger.info("These are complete, functional viral genomes that exist in nature.")
+        logger.info("="*70)
         viable_sequences = await self.harvester.harvest_all_viable_genomes(max_sequences=max_viable)
         
         # Step 2: Generate synthetic non-viable
+        logger.info("")
         logger.info("="*70)
         logger.info("STEP 2: Generating synthetic non-viable genomes")
+        logger.info("="*70)
+        logger.info("NOTE: Non-viable viruses are NOT downloaded from NCBI.")
+        logger.info("      They are generated synthetically using various methods:")
+        logger.info("      - Random sequences")
+        logger.info("      - Fragmented genomes (missing essential parts)")
+        logger.info("      - No start codons (can't initiate translation)")
+        logger.info("      - No stop codons (can't terminate translation)")
+        logger.info("      - Invalid codons (contains N's and invalid bases)")
+        logger.info("      - Too short sequences")
+        logger.info("      - Missing essential genes")
         logger.info("="*70)
         self.harvester.generate_non_viable_genomes(
             count=num_synthetic_non_viable,
@@ -86,8 +100,12 @@ class DataCollector:
         
         # Step 3: Generate mutated non-viable
         if viable_sequences and num_mutated_non_viable > 0:
+            logger.info("")
             logger.info("="*70)
             logger.info("STEP 3: Generating mutated non-viable genomes")
+            logger.info("="*70)
+            logger.info("These are created by mutating viable genomes to make them non-viable.")
+            logger.info("Mutation types: delete_start, insert_stop, frame_shift, corrupt")
             logger.info("="*70)
             self.harvester.generate_from_viable(viable_sequences, count=num_mutated_non_viable)
         
@@ -95,11 +113,11 @@ class DataCollector:
         logger.info("="*70)
         logger.info("DATA COLLECTION COMPLETE!")
         logger.info("="*70)
-        logger.info(f"✓ Viable genomes: {len(viable_sequences)}")
-        logger.info(f"✓ Synthetic non-viable: {num_synthetic_non_viable}")
-        logger.info(f"✓ Mutated non-viable: {num_mutated_non_viable}")
-        logger.info(f"✓ Total training samples: {len(viable_sequences) + num_synthetic_non_viable + num_mutated_non_viable}")
-        logger.info(f"✓ Data location: {self.harvester.data_dir}")
+        logger.info(f"[+] Viable genomes: {len(viable_sequences)}")
+        logger.info(f"[+] Synthetic non-viable: {num_synthetic_non_viable}")
+        logger.info(f"[+] Mutated non-viable: {num_mutated_non_viable}")
+        logger.info(f"[+] Total training samples: {len(viable_sequences) + num_synthetic_non_viable + num_mutated_non_viable}")
+        logger.info(f"[+] Data location: {self.harvester.data_dir}")
         
         total_collected = len(viable_sequences) + num_synthetic_non_viable + num_mutated_non_viable
         
