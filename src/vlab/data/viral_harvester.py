@@ -46,9 +46,13 @@ class ViralGenomeHarvester:
         self.max_concurrent = max_concurrent
         self.semaphore = asyncio.Semaphore(max_concurrent)
         
+        # Configure Entrez with email and API key (required by NCBI)
         Entrez.email = email
         if api_key:
             Entrez.api_key = api_key
+        else:
+            logger.warning("No API key provided. NCBI requests will be slower (3 requests/second vs 10 requests/second with API key).")
+            logger.warning("Get an API key from: https://www.ncbi.nlm.nih.gov/account/settings/")
         
         # SSL setup
         ca_bundle = os.getenv("SSL_CERT_FILE") or os.getenv("REQUESTS_CA_BUNDLE")
@@ -134,38 +138,26 @@ class ViralGenomeHarvester:
         except Exception as e:
             logger.warning(f"Checkpoint save failed: {e}")
     
-    async def harvest_all_viable_genomes(self, max_sequences=250000):
-        """Harvest all viable viral genomes from NCBI"""
-        logger.info(f"Starting harvest of up to {max_sequences} viable viral genomes")
+    async def _search_with_retry(self, search_term, max_retries=3, delay=3):
+        """Search with retry logic and better error handling"""
+        original_search_term = search_term
         
-        # Comprehensive search terms for viable genomes
-        search_terms = [
-            # Tier 1: Highest quality - RefSeq complete genomes
-            "viruses[ORGN] AND complete genome[TITLE] AND refseq[FILTER]",
-            
-            # Tier 2: Complete genomes by major families
-            "viruses[ORGN] AND complete genome[TITLE] AND (Adenoviridae[ORGN] OR Herpesviridae[ORGN] OR Poxviridae[ORGN] OR Retroviridae[ORGN] OR Flaviviridae[ORGN] OR Coronaviridae[ORGN] OR Picornaviridae[ORGN] OR Parvoviridae[ORGN] OR Rhabdoviridae[ORGN] OR Paramyxoviridae[ORGN])",
-            
-            # Tier 3: Broad complete genomes
-            "viruses[ORGN] AND complete genome[TITLE]",
-            
-            # Tier 4: Representative genomes
-            "viruses[ORGN] AND representative genome[TITLE]",
-            
-            # Tier 5: Reference genomes
-            "viruses[ORGN] AND reference genome[TITLE]",
-        ]
-        
-        all_ids = set()
-        
-        for search_term in search_terms:
-            if len(all_ids) >= max_sequences:
-                break
-            
+        for attempt in range(max_retries):
             try:
-                logger.info(f"Searching: {search_term[:80]}...")
+                logger.info(f"Searching (attempt {attempt+1}/{max_retries}): {search_term[:80]}...")
+                
+                # Add delay between attempts (longer delay for retries)
+                if attempt > 0:
+                    wait_time = delay * (2 ** attempt)  # Exponential backoff: 6s, 12s, 24s
+                    logger.info(f"  Waiting {wait_time}s before retry (rate limiting protection)...")
+                    await asyncio.sleep(wait_time)
+                
+                # Add initial delay to avoid hitting rate limits
+                if attempt == 0:
+                    await asyncio.sleep(1)  # 1 second delay before first attempt
                 
                 # Use WebEnv for pagination
+                # Note: Entrez.email and Entrez.api_key are set in __init__
                 search_handle = Entrez.esearch(
                     db="nucleotide",
                     term=search_term,
@@ -179,14 +171,82 @@ class ViralGenomeHarvester:
                 query_key = search_results["QueryKey"]
                 total_count = int(search_results["Count"])
                 
-                logger.info(f"Found {total_count:,} sequences")
+                logger.info(f"  ✓ Found {total_count:,} sequences")
+                return webenv, query_key, total_count
                 
-                if total_count == 0:
-                    continue
+            except Exception as e:
+                error_msg = str(e)
+                if "400" in error_msg or "Bad Request" in error_msg:
+                    logger.warning(f"  ⚠ HTTP 400 Bad Request: {error_msg}")
+                    logger.warning(f"    Possible causes: Rate limiting, invalid query syntax, or NCBI server issues")
+                    
+                    # Try simplified query on retry if original had complex filters
+                    if attempt < max_retries - 1 and "[FILTER]" in search_term:
+                        search_term = search_term.replace(" AND refseq[FILTER]", "")
+                        logger.info(f"    Retrying with simplified query: {search_term[:80]}...")
+                    elif attempt < max_retries - 1 and "[TITLE]" in search_term:
+                        # Try even simpler version
+                        search_term = search_term.replace("[TITLE]", "")
+                        logger.info(f"    Retrying with simpler query: {search_term[:80]}...")
+                elif "429" in error_msg or "Rate" in error_msg:
+                    logger.warning(f"  ⚠ Rate limited: {error_msg}")
+                    logger.warning(f"    Waiting longer before retry...")
+                    wait_time = 30 * (attempt + 1)  # Wait 30s, 60s, 90s
+                    await asyncio.sleep(wait_time)
+                else:
+                    logger.warning(f"  ⚠ Search error: {error_msg}")
                 
+                if attempt == max_retries - 1:
+                    logger.error(f"  ✗ Search failed after {max_retries} attempts")
+                    logger.error(f"    Search term: {original_search_term[:80]}...")
+                    return None, None, 0
+        
+        return None, None, 0
+    
+    async def harvest_all_viable_genomes(self, max_sequences=250000):
+        """Harvest all viable viral genomes from NCBI"""
+        logger.info(f"Starting harvest of up to {max_sequences} viable viral genomes")
+        logger.info("="*70)
+        logger.info("NOTE: NCBI API may return HTTP 400 errors due to:")
+        logger.info("  - Rate limiting (temporary - will retry automatically)")
+        logger.info("  - Server load (temporary - will retry automatically)")
+        logger.info("  - Query complexity (will automatically simplify queries)")
+        logger.info("The system will retry with exponential backoff and simplified queries.")
+        logger.info("Some searches may fail, but the system will continue with successful ones.")
+        logger.info("="*70)
+        
+        # Comprehensive search terms for viable genomes (simplified to avoid 400 errors)
+        search_terms = [
+            # Tier 1: Complete genomes (simplified - removed complex filters)
+            "viruses[ORGN] AND complete genome",
+            
+            # Tier 2: Representative genomes
+            "viruses[ORGN] AND representative genome",
+            
+            # Tier 3: Reference genomes
+            "viruses[ORGN] AND reference genome",
+            
+            # Tier 4: Broad viral genome search
+            "viruses[ORGN] AND genome",
+        ]
+        
+        all_ids = set()
+        
+        for search_term in search_terms:
+            if len(all_ids) >= max_sequences:
+                break
+            
+            # Search with retry
+            webenv, query_key, total_count = await self._search_with_retry(search_term)
+            
+            if webenv is None or total_count == 0:
+                logger.warning(f"Skipping search term (failed or no results): {search_term[:80]}...")
+                continue
+            
+            try:
                 # Fetch IDs in batches (NCBI limit: 10,000 per request)
                 remaining_slots = max_sequences - len(all_ids)
-                ids_to_fetch = min(total_count, remaining_slots)  # No per-search limit - collect all available
+                ids_to_fetch = min(total_count, remaining_slots)
                 
                 fetched = 0
                 batch_size = 10000
@@ -194,29 +254,62 @@ class ViralGenomeHarvester:
                 while fetched < ids_to_fetch:
                     current_batch = min(batch_size, ids_to_fetch - fetched)
                     
-                    fetch_handle = Entrez.efetch(
-                        db="nucleotide",
-                        rettype="acc",
-                        retmode="text",
-                        retstart=fetched,
-                        retmax=current_batch,
-                        webenv=webenv,
-                        query_key=query_key
-                    )
-                    
-                    id_text = fetch_handle.read()
-                    fetch_handle.close()
-                    
-                    new_ids = [id.strip() for id in id_text.split('\n') if id.strip()]
-                    all_ids.update(new_ids)
-                    fetched += len(new_ids)
-                    
-                    logger.info(f"  Fetched {fetched:,}/{ids_to_fetch:,} IDs")
-                    await asyncio.sleep(0.5)
+                    try:
+                        fetch_handle = Entrez.efetch(
+                            db="nucleotide",
+                            rettype="acc",
+                            retmode="text",
+                            retstart=fetched,
+                            retmax=current_batch,
+                            webenv=webenv,
+                            query_key=query_key,
+                            api_key=self.api_key if self.api_key else None,
+                            email=self.email
+                        )
+                        
+                        id_text = fetch_handle.read()
+                        fetch_handle.close()
+                        
+                        new_ids = [id.strip() for id in id_text.split('\n') if id.strip()]
+                        all_ids.update(new_ids)
+                        fetched += len(new_ids)
+                        
+                        logger.info(f"  Fetched {fetched:,}/{ids_to_fetch:,} IDs")
+                        await asyncio.sleep(0.5)  # Rate limiting
+                        
+                    except Exception as e:
+                        logger.warning(f"  Error fetching IDs batch: {e}")
+                        await asyncio.sleep(5)  # Wait before retry
+                        if fetched > 0:
+                            break  # If we got some IDs, continue to next search term
+                        else:
+                            raise  # If we got nothing, raise to skip this search term
             
             except Exception as e:
-                logger.error(f"Search failed: {e}")
+                logger.error(f"Failed to fetch IDs for search term: {e}")
                 continue
+            
+            # Wait between search terms to avoid rate limiting
+            await asyncio.sleep(1)
+        
+        # Log summary of search results
+        if len(all_ids) == 0:
+            logger.warning("="*70)
+            logger.warning("WARNING: No genome IDs found from NCBI searches!")
+            logger.warning("This could be due to:")
+            logger.warning("  1. All searches failed (HTTP 400 errors)")
+            logger.warning("  2. NCBI rate limiting (wait and retry)")
+            logger.warning("  3. Network connectivity issues")
+            logger.warning("="*70)
+            logger.warning("The system will continue with synthetic non-viable genome generation.")
+            logger.warning("You may want to:")
+            logger.warning("  - Wait a few minutes and retry")
+            logger.warning("  - Check your internet connection")
+            logger.warning("  - Verify your NCBI API key is valid")
+            logger.warning("  - Reduce TOTAL_TARGET to a smaller number for testing")
+            logger.warning("="*70)
+        else:
+            logger.info(f"✓ Successfully found {len(all_ids):,} genome IDs from NCBI")
         
         # Filter out completed IDs - also check if files exist on disk
         # This ensures we don't try to download files that already exist
