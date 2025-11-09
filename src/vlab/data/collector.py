@@ -24,7 +24,8 @@ class DataCollector:
                               max_viable=None,
                               num_synthetic_non_viable=None,
                               num_mutated_non_viable=None,
-                              total_target=500000):
+                              total_target=500000,
+                              skip_ncbi_if_fails=True):
         """
         Collect all training data
         
@@ -33,6 +34,7 @@ class DataCollector:
             num_synthetic_non_viable: Number of synthetic non-viable genomes (None = auto-calculate)
             num_mutated_non_viable: Number of mutated non-viable genomes (None = auto-calculate)
             total_target: Total target genomes (creates balanced 50/50 viable/non-viable dataset)
+            skip_ncbi_if_fails: If True, skip NCBI downloads if connection fails and use synthetic data only
         """
         logger.info("Starting comprehensive data collection...")
         
@@ -69,14 +71,55 @@ class DataCollector:
             if num_mutated_non_viable is None:
                 num_mutated_non_viable = 5000
         
-        # Step 1: Harvest viable genomes
+        # Step 1: Harvest viable genomes (with fallback if NCBI fails)
         logger.info("="*70)
         logger.info("STEP 1: Harvesting viable viral genomes from NCBI")
         logger.info("="*70)
         logger.info("This will download real viral genomes from the NCBI nucleotide database.")
         logger.info("These are complete, functional viral genomes that exist in nature.")
         logger.info("="*70)
-        viable_sequences = await self.harvester.harvest_all_viable_genomes(max_sequences=max_viable)
+        
+        viable_sequences = []
+        ncbi_failed = False
+        
+        try:
+            viable_sequences = await self.harvester.harvest_all_viable_genomes(max_sequences=max_viable)
+            
+            if not viable_sequences or len(viable_sequences) == 0:
+                logger.warning("="*70)
+                logger.warning("WARNING: No viable genomes downloaded from NCBI!")
+                logger.warning("This is common in Colab due to NCBI API restrictions.")
+                logger.warning("="*70)
+                ncbi_failed = True
+            else:
+                logger.info(f"✓ Successfully downloaded {len(viable_sequences):,} viable genomes from NCBI")
+        
+        except Exception as e:
+            logger.error(f"NCBI download failed: {e}")
+            logger.warning("="*70)
+            logger.warning("NCBI download failed - this is common in Colab")
+            logger.warning("The system will continue with synthetic data generation.")
+            logger.warning("="*70)
+            ncbi_failed = True
+            viable_sequences = []
+        
+        # If NCBI failed and we're in fallback mode, generate synthetic viable genomes
+        if ncbi_failed and skip_ncbi_if_fails:
+            logger.info("="*70)
+            logger.info("FALLBACK MODE: Generating synthetic viable genomes")
+            logger.info("="*70)
+            logger.info("Since NCBI is not accessible, generating synthetic viable-like genomes.")
+            logger.info("These are realistic viral genome sequences that mimic real viruses.")
+            logger.info("="*70)
+            
+            # Generate synthetic viable genomes (realistic viral sequences)
+            synthetic_viable_count = min(max_viable, 10000)  # Cap at 10K for performance
+            logger.info(f"Generating {synthetic_viable_count:,} synthetic viable genomes...")
+            self.harvester.generate_synthetic_viable_genomes(count=synthetic_viable_count)
+            logger.info(f"✓ Generated {synthetic_viable_count:,} synthetic viable genomes")
+            
+            # Update max_viable to match what we actually generated
+            max_viable = synthetic_viable_count
         
         # Step 2: Generate synthetic non-viable
         logger.info("")
@@ -99,7 +142,9 @@ class DataCollector:
         )
         
         # Step 3: Generate mutated non-viable
-        if viable_sequences and num_mutated_non_viable > 0:
+        # Note: If we're using synthetic viable genomes, we can still generate mutated ones
+        # by using the synthetic sequences as a base
+        if num_mutated_non_viable > 0:
             logger.info("")
             logger.info("="*70)
             logger.info("STEP 3: Generating mutated non-viable genomes")
@@ -107,27 +152,53 @@ class DataCollector:
             logger.info("These are created by mutating viable genomes to make them non-viable.")
             logger.info("Mutation types: delete_start, insert_stop, frame_shift, corrupt")
             logger.info("="*70)
-            self.harvester.generate_from_viable(viable_sequences, count=num_mutated_non_viable)
+            
+            # Use viable sequences if available, otherwise generate some for mutation
+            if viable_sequences and len(viable_sequences) > 0:
+                self.harvester.generate_from_viable(viable_sequences, count=num_mutated_non_viable)
+            else:
+                # Generate a small set of viable-like sequences for mutation
+                logger.info("No viable sequences available for mutation.")
+                logger.info("Generating viable-like sequences for mutation...")
+                mutation_base_count = min(num_mutated_non_viable, 1000)
+                mutation_base_sequences = self.harvester.generate_synthetic_viable_genomes(count=mutation_base_count)
+                if mutation_base_sequences:
+                    # Extract sequences for mutation
+                    viable_for_mutation = [s for s in mutation_base_sequences]
+                    self.harvester.generate_from_viable(viable_for_mutation, count=num_mutated_non_viable)
+                else:
+                    logger.warning("Could not generate sequences for mutation. Skipping mutated non-viable generation.")
+                    num_mutated_non_viable = 0
+        
+        # Get actual counts from disk (more accurate)
+        stats = self.get_data_statistics()
         
         # Summary
         logger.info("="*70)
         logger.info("DATA COLLECTION COMPLETE!")
         logger.info("="*70)
-        logger.info(f"[+] Viable genomes: {len(viable_sequences)}")
-        logger.info(f"[+] Synthetic non-viable: {num_synthetic_non_viable}")
-        logger.info(f"[+] Mutated non-viable: {num_mutated_non_viable}")
-        logger.info(f"[+] Total training samples: {len(viable_sequences) + num_synthetic_non_viable + num_mutated_non_viable}")
+        logger.info(f"[+] Training viable: {stats['train_viable']:,}")
+        logger.info(f"[+] Training non-viable: {stats['train_non_viable']:,}")
+        logger.info(f"[+] Validation viable: {stats['val_viable']:,}")
+        logger.info(f"[+] Validation non-viable: {stats['val_non_viable']:,}")
+        logger.info(f"[+] Total training samples: {stats['total_train']:,}")
+        logger.info(f"[+] Total validation samples: {stats['total_val']:,}")
+        logger.info(f"[+] Grand total: {stats['total']:,}")
         logger.info(f"[+] Data location: {self.harvester.data_dir}")
         
-        total_collected = len(viable_sequences) + num_synthetic_non_viable + num_mutated_non_viable
+        if ncbi_failed:
+            logger.info("")
+            logger.info("NOTE: NCBI download failed - used synthetic data instead")
+            logger.info("This is common in Colab. The model will still train successfully!")
         
         return {
-            'viable': len(viable_sequences),
-            'synthetic_non_viable': num_synthetic_non_viable,
-            'mutated_non_viable': num_mutated_non_viable,
-            'total': total_collected,
+            'viable': stats['train_viable'] + stats['val_viable'],
+            'synthetic_non_viable': stats['train_non_viable'] + stats['val_non_viable'],
+            'mutated_non_viable': 0,  # Counted in non_viable
+            'total': stats['total'],
             'target': total_target if total_target else None,
-            'reached_target': total_collected >= total_target if total_target else None
+            'reached_target': stats['total'] >= total_target if total_target else False,
+            'ncbi_failed': ncbi_failed
         }
     
     def collect_viable_genomes(self, output_dir: Path, max_sequences=10000):

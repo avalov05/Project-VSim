@@ -141,7 +141,8 @@ try:
         max_viable=None,
         num_synthetic_non_viable=None,
         num_mutated_non_viable=None,
-        total_target=TOTAL_TARGET
+        total_target=TOTAL_TARGET,
+        skip_ncbi_if_fails=True  # Use synthetic data if NCBI fails (common in Colab)
     ))
     
     stats = collector.get_data_statistics()
