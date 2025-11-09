@@ -65,12 +65,13 @@ print("="*70)
 print("\n[1/6] Installing dependencies...")
 os.system("pip install -q biopython numpy pandas scipy scikit-learn torch torchvision torchaudio pyyaml requests aiohttp tqdm backoff matplotlib nest-asyncio")
 
-# Step 2: Clone repository (if not already cloned)
+# Step 2: Clone or update repository
 repo_name = GITHUB_REPO.split('/')[-1]
 project_dir = Path(f'/content/{repo_name}')
+repo_url = f"https://github.com/{GITHUB_REPO}.git"
+
 if not project_dir.exists():
     print(f"\n[2/6] Cloning repository: {GITHUB_REPO}...")
-    repo_url = f"https://github.com/{GITHUB_REPO}.git"
     try:
         result = subprocess.run(['git', 'clone', repo_url, str(project_dir)], 
                               check=True, capture_output=True, text=True)
@@ -82,6 +83,36 @@ if not project_dir.exists():
         raise
 else:
     print(f"\n[2/6] Repository already exists at {project_dir}")
+    # Check if it's a git repository and sync with latest changes
+    git_dir = project_dir / '.git'
+    if git_dir.exists():
+        print("  Syncing with latest changes from repository...")
+        try:
+            # Change to project directory first
+            original_dir = os.getcwd()
+            os.chdir(project_dir)
+            # Fetch latest changes
+            subprocess.run(['git', 'fetch', 'origin'], check=True, capture_output=True, text=True)
+            # Reset to latest main/master branch (try main first, then master)
+            try:
+                subprocess.run(['git', 'reset', '--hard', 'origin/main'], check=True, capture_output=True, text=True)
+                print("✓ Synced with origin/main")
+            except subprocess.CalledProcessError:
+                try:
+                    subprocess.run(['git', 'reset', '--hard', 'origin/master'], check=True, capture_output=True, text=True)
+                    print("✓ Synced with origin/master")
+                except subprocess.CalledProcessError:
+                    # If both fail, just pull
+                    subprocess.run(['git', 'pull'], check=True, capture_output=True, text=True)
+                    print("✓ Pulled latest changes")
+        except subprocess.CalledProcessError as e:
+            print(f"⚠ Warning: Could not sync repository: {e}")
+            print("  Continuing with existing code...")
+        finally:
+            # Make sure we're back in the project directory
+            os.chdir(project_dir)
+    else:
+        print("  (Not a git repository - skipping sync)")
 
 # Step 3: Navigate to project directory
 print(f"\n[3/6] Setting up environment...")

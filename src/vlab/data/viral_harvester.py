@@ -617,8 +617,8 @@ class ViralGenomeHarvester:
                    miniters=1, mininterval=0.5, file=sys.stdout)
         
         async with aiohttp.ClientSession(connector=connector) as session:
-            # Create batch tracking
-            batch_tasks = {}
+            # Create batch tracking - use a list of tuples to preserve order and mapping
+            batch_info = []  # List of (batch_num, batch_ids, task)
             total_batches = (len(remaining_ids) + batch_size - 1) // batch_size
             logger.info(f"Creating {total_batches} download batches...")
             sys.stdout.flush()
@@ -629,7 +629,7 @@ class ViralGenomeHarvester:
                 # Create a task from the coroutine
                 coro = self._fetch_batch_async(session, batch_ids, batch_num)
                 task = asyncio.create_task(coro)
-                batch_tasks[task] = (batch_num, batch_ids)
+                batch_info.append((batch_num, batch_ids, task))
             
             logger.info(f"All batches queued. Starting parallel downloads...")
             print(f"\n{'='*70}", flush=True)
@@ -642,91 +642,271 @@ class ViralGenomeHarvester:
             last_update_time = time.time()
             last_save_time = time.time()
             
-            # Process completed batches
-            for task in asyncio.as_completed(batch_tasks.keys()):
-                batch_num, batch_ids = batch_tasks[task]
-                try:
-                    batch_result = await task
-                    batch_size_actual = len(batch_result)
-                    sequences.extend(batch_result)
-                    completed_batches += 1
+            # Process completed batches using as_completed with proper task tracking
+            # Create a mapping from task to batch info for easy lookup
+            task_to_batch = {task: (bn, bid) for bn, bid, task in batch_info}
+            
+            try:
+                # Process tasks as they complete
+                for completed_future in asyncio.as_completed([task for _, _, task in batch_info]):
+                    batch_num = None
+                    batch_ids = None
+                    batch_result = None
+                    task_error = None
                     
-                    # Save each sequence immediately to disk (skips if already exists)
-                    batch_saved = 0
-                    batch_existed = 0
-                    for seq in batch_result:
-                        acc = seq.get('accession')
-                        if not acc:
+                    try:
+                        # Await the completed future to get the result
+                        batch_result = await completed_future
+                        
+                        # Find which batch this task belongs to by checking which task completed
+                        # We need to find the task in our batch_info list
+                        for bn, bid, task in batch_info:
+                            if task.done():
+                                try:
+                                    # Check if this is the completed task
+                                    if task == completed_future or (hasattr(completed_future, 'result') and task.result() == batch_result):
+                                        batch_num = bn
+                                        batch_ids = bid
+                                        break
+                                    # Alternative: check by exception status
+                                    if task.exception() is None and isinstance(batch_result, list):
+                                        # This task completed successfully - verify it matches
+                                        batch_num = bn
+                                        batch_ids = bid
+                                        break
+                                except Exception:
+                                    continue
+                        
+                        # If we still don't have batch info, try to match by finding the task
+                        if batch_num is None:
+                            for bn, bid, task in batch_info:
+                                if task.done() and not task.cancelled():
+                                    try:
+                                        if task.exception() is None:
+                                            result = task.result()
+                                            if result == batch_result or (isinstance(result, list) and isinstance(batch_result, list) and len(result) == len(batch_result)):
+                                                batch_num = bn
+                                                batch_ids = bid
+                                                batch_result = result
+                                                break
+                                    except Exception:
+                                        pass
+                        
+                        # If batch_result is not a list, something went wrong
+                        if not isinstance(batch_result, list):
+                            logger.warning(f"Batch result is not a list: {type(batch_result)}")
+                            # Try to get it from the task directly
+                            for bn, bid, task in batch_info:
+                                if task.done():
+                                    try:
+                                        result = task.result()
+                                        if isinstance(result, list):
+                                            batch_num = bn
+                                            batch_ids = bid
+                                            batch_result = result
+                                            break
+                                    except Exception as te:
+                                        if batch_num is None:
+                                            batch_num = bn
+                                            batch_ids = bid
+                                            task_error = str(te)
+                                        continue
+                        
+                        # If we still have no batch info, log and continue
+                        if batch_num is None or batch_result is None:
+                            logger.warning("Could not match completed task to batch info")
+                            # Try to process any available results
+                            for bn, bid, task in batch_info:
+                                if task.done() and not task.cancelled():
+                                    try:
+                                        result = task.result()
+                                        if isinstance(result, list) and len(result) > 0:
+                                            batch_num = bn
+                                            batch_ids = bid
+                                            batch_result = result
+                                            break
+                                    except Exception:
+                                        continue
+                            
+                            if batch_result is None:
+                                continue
+                        
+                        # Process the batch result
+                        if len(batch_result) == 0:
                             continue
                         
-                        # Check if already exists before trying to save
-                        target_dir = self.viable_dir if (int(hashlib.md5(acc.encode()).hexdigest(), 16) % 10) < 9 else self.val_viable_dir
-                        filepath = target_dir / f"{acc}.fasta"
+                        batch_size_actual = len(batch_result)
+                        sequences.extend(batch_result)
+                        completed_batches += 1
                         
-                        if filepath.exists():
-                            # Already exists - just mark as completed
-                            batch_existed += 1
-                            self.completed_ids.add(acc)
-                        else:
-                            # Save new file
-                            if self._save_sequence_immediate(seq):
-                                batch_saved += 1
-                                saved_count += 1
+                        # Save each sequence immediately to disk (skips if already exists)
+                        batch_saved = 0
+                        batch_existed = 0
+                        for seq in batch_result:
+                            if not isinstance(seq, dict):
+                                continue
+                            acc = seq.get('accession')
+                            if not acc:
+                                continue
+                            
+                            # Check if already exists before trying to save
+                            target_dir = self.viable_dir if (int(hashlib.md5(acc.encode()).hexdigest(), 16) % 10) < 9 else self.val_viable_dir
+                            filepath = target_dir / f"{acc}.fasta"
+                            
+                            if filepath.exists():
+                                # Already exists - just mark as completed
+                                batch_existed += 1
                                 self.completed_ids.add(acc)
-                    
-                    # Immediate feedback on first batch
-                    if not first_batch_done:
-                        pbar.write(f"\n[STARTED] First batch downloaded! {batch_size_actual} sequences received.")
-                        if batch_saved > 0:
-                            pbar.write(f"[INFO] {batch_saved} new sequences saved, {batch_existed} already existed.")
-                        else:
-                            pbar.write(f"[INFO] All {batch_existed} sequences already existed (skipped saving).")
-                        pbar.write(f"[INFO] Downloads are now in progress. New sequences saved immediately to disk.")
-                        sys.stdout.flush()
-                        first_batch_done = True
-                    
-                    # Update progress bar immediately
-                    pbar.update(batch_size_actual)
-                    pbar.refresh()  # Force refresh
-                    
-                    # Detailed logging every 100 sequences OR every 5 seconds (whichever comes first)
-                    current_time = time.time()
-                    time_since_update = current_time - last_update_time
-                    should_log = (len(sequences) - last_log_count >= 100) or (time_since_update >= 5)
-                    
-                    if should_log:
-                        elapsed = time.time() - start_time
-                        rate = len(sequences) / elapsed if elapsed > 0 else 0
-                        remaining = (total_to_download - len(sequences)) / rate if rate > 0 else 0
+                            else:
+                                # Save new file
+                                if self._save_sequence_immediate(seq):
+                                    batch_saved += 1
+                                    saved_count += 1
+                                    self.completed_ids.add(acc)
                         
-                        # Write to progress bar (appears above it)
-                        pbar.write(f"\n[PROGRESS] Downloaded: {len(sequences):,}/{total_to_download:,} "
-                                  f"({len(sequences)*100/total_to_download:.2f}%) | "
-                                  f"Saved: {saved_count:,} | "
-                                  f"Rate: {rate:.1f} seq/s | "
-                                  f"ETA: {remaining/60:.1f} min | "
-                                  f"Batches: {completed_batches}/{total_batches}")
-                        sys.stdout.flush()
-                        last_log_count = len(sequences)
-                        last_update_time = current_time
-                    
-                    # Save checkpoint every 100 sequences or every 30 seconds (more frequent)
-                    current_time = time.time()
-                    if (saved_count % 100 == 0 and saved_count > 0) or (current_time - last_checkpoint_time > 30):
-                        self._save_checkpoint()
-                        last_checkpoint_time = current_time
-                        if current_time - last_save_time > 60:  # Only log every minute
-                            pbar.write(f"[CHECKPOINT] Saved progress: {saved_count:,} sequences saved to disk")
+                        # Immediate feedback on first batch
+                        if not first_batch_done:
+                            pbar.write(f"\n[STARTED] First batch downloaded! {batch_size_actual} sequences received.")
+                            if batch_saved > 0:
+                                pbar.write(f"[INFO] {batch_saved} new sequences saved, {batch_existed} already existed.")
+                            else:
+                                pbar.write(f"[INFO] All {batch_existed} sequences already existed (skipped saving).")
+                            pbar.write(f"[INFO] Downloads are now in progress. New sequences saved immediately to disk.")
                             sys.stdout.flush()
-                            last_save_time = current_time
+                            first_batch_done = True
+                        
+                        # Update progress bar immediately
+                        pbar.update(batch_size_actual)
+                        pbar.refresh()  # Force refresh
+                        
+                        # Detailed logging every 100 sequences OR every 5 seconds (whichever comes first)
+                        current_time = time.time()
+                        time_since_update = current_time - last_update_time
+                        should_log = (len(sequences) - last_log_count >= 100) or (time_since_update >= 5)
+                        
+                        if should_log:
+                            elapsed = time.time() - start_time
+                            rate = len(sequences) / elapsed if elapsed > 0 else 0
+                            remaining = (total_to_download - len(sequences)) / rate if rate > 0 else 0
+                            
+                            # Write to progress bar (appears above it)
+                            pbar.write(f"\n[PROGRESS] Downloaded: {len(sequences):,}/{total_to_download:,} "
+                                      f"({len(sequences)*100/total_to_download:.2f}%) | "
+                                      f"Saved: {saved_count:,} | "
+                                      f"Rate: {rate:.1f} seq/s | "
+                                      f"ETA: {remaining/60:.1f} min | "
+                                      f"Batches: {completed_batches}/{total_batches}")
+                            sys.stdout.flush()
+                            last_log_count = len(sequences)
+                            last_update_time = current_time
+                        
+                        # Save checkpoint every 100 sequences or every 30 seconds (more frequent)
+                        current_time = time.time()
+                        if (saved_count % 100 == 0 and saved_count > 0) or (current_time - last_checkpoint_time > 30):
+                            self._save_checkpoint()
+                            last_checkpoint_time = current_time
+                            if current_time - last_save_time > 60:  # Only log every minute
+                                pbar.write(f"[CHECKPOINT] Saved progress: {saved_count:,} sequences saved to disk")
+                                sys.stdout.flush()
+                                last_save_time = current_time
+                    
+                    except Exception as e:
+                        # Safely extract error message, handling coroutines
+                        try:
+                            error_msg = str(e)
+                            error_type = type(e).__name__
+                        except Exception:
+                            error_msg = "Unknown error"
+                            error_type = "Exception"
+                        
+                        # Check if error contains coroutine (indicates async issue)
+                        if 'coroutine' in error_msg.lower() or (hasattr(e, '__class__') and 'coroutine' in str(type(e)).lower()):
+                            error_msg = f"Async operation error: {error_type}"
+                            logger.warning(f"Coroutine-related error detected: {error_type}")
+                        
+                        # Find the failed batch by checking all tasks
+                        batch_num_failed = batch_num
+                        batch_ids_failed = batch_ids
+                        
+                        if batch_num_failed is None:
+                            # Find any task that has an exception
+                            for bn, bid, task in batch_info:
+                                if task.done():
+                                    try:
+                                        task.exception()  # This will raise if there's an exception
+                                    except Exception:
+                                        batch_num_failed = bn
+                                        batch_ids_failed = bid
+                                        break
+                        
+                        if batch_num_failed is not None:
+                            failed_batches.append((batch_num_failed, batch_ids_failed or [], error_msg))
+                            if batch_num_failed not in failed_batch_ids:
+                                failed_batch_ids[batch_num_failed] = batch_ids_failed or []
+                            pbar.write(f"[WARNING] Batch {batch_num_failed} failed: {error_msg}. Will retry later.")
+                            sys.stdout.flush()
+                            logger.warning(f"Batch {batch_num_failed} failed: {error_msg}")
+            
+            except Exception as outer_e:
+                # Handle errors in the as_completed iteration itself
+                try:
+                    error_msg = str(outer_e)
+                    error_type = type(outer_e).__name__
+                except Exception:
+                    error_msg = "Unknown error in batch processing"
+                    error_type = "Exception"
                 
-                except Exception as e:
-                    # Track failed batch for retry
-                    failed_batches.append((batch_num, batch_ids, str(e)))
-                    failed_batch_ids[batch_num] = batch_ids
-                    pbar.write(f"[WARNING] Batch {batch_num} failed: {e}. Will retry later.")
-                    sys.stdout.flush()
-                    continue
+                # Check for coroutine in error - this is the key issue
+                if 'coroutine' in error_msg.lower() or (hasattr(outer_e, '__class__') and 'coroutine' in str(type(outer_e)).lower()):
+                    error_msg = f"Async iteration error: {error_type}"
+                    logger.error(f"Critical async error in batch processing: {error_msg}")
+                    logger.error("Attempting to process batches using alternative method...")
+                    
+                    # Alternative: wait for all tasks and process results
+                    logger.info("Waiting for all batches to complete...")
+                    for bn, bid, task in batch_info:
+                        try:
+                            if not task.done():
+                                await asyncio.wait_for(task, timeout=300)  # Wait up to 5 minutes per batch
+                        except asyncio.TimeoutError:
+                            logger.warning(f"Batch {bn} timed out")
+                            failed_batches.append((bn, bid, "Timeout"))
+                            failed_batch_ids[bn] = bid
+                        except Exception as te:
+                            error_str = str(te)
+                            if 'coroutine' not in error_str.lower():
+                                logger.warning(f"Batch {bn} error: {error_str}")
+                            failed_batches.append((bn, bid, error_str))
+                            failed_batch_ids[bn] = bid
+                    
+                    # Now process completed tasks
+                    for bn, bid, task in batch_info:
+                        if task.done() and not task.cancelled():
+                            try:
+                                result = task.result()
+                                if isinstance(result, list) and len(result) > 0:
+                                    sequences.extend(result)
+                                    completed_batches += 1
+                                    # Save sequences
+                                    for seq in result:
+                                        acc = seq.get('accession') if isinstance(seq, dict) else None
+                                        if acc:
+                                            if self._save_sequence_immediate(seq):
+                                                saved_count += 1
+                                                self.completed_ids.add(acc)
+                                    pbar.update(len(result))
+                            except Exception as te:
+                                error_str = str(te)
+                                if 'coroutine' not in error_str.lower():
+                                    failed_batches.append((bn, bid, error_str))
+                                    failed_batch_ids[bn] = bid
+                else:
+                    logger.error(f"Error in as_completed loop: {error_msg}", exc_info=True)
+                    # Mark all remaining batches as failed for retry
+                    for bn, bid, task in batch_info:
+                        if not task.done():
+                            failed_batches.append((bn, bid, error_msg))
+                            failed_batch_ids[bn] = bid
         
         # Retry failed batches with exponential backoff (session still open)
         if failed_batches:
@@ -751,6 +931,7 @@ class ViralGenomeHarvester:
                     await asyncio.sleep(wait_time)
                 
                 retry_tasks = {}
+                retry_batch_info = []  # List of (batch_num, batch_ids, task) for retries
                 remaining_failed = []
                 
                 for batch_num, batch_ids, error_msg in failed_batches:
@@ -763,30 +944,125 @@ class ViralGenomeHarvester:
                     coro = self._fetch_batch_async(session, remaining_batch_ids, f"R{batch_num}")
                     task = asyncio.create_task(coro)
                     retry_tasks[task] = (batch_num, remaining_batch_ids)
+                    retry_batch_info.append((batch_num, remaining_batch_ids, task))
                 
                 # Process retry batches
                 if retry_tasks:
-                    for task in asyncio.as_completed(retry_tasks.keys()):
-                        batch_num, batch_ids = retry_tasks[task]
-                        try:
-                            batch_result = await task
-                            batch_saved = 0
-                            for seq in batch_result:
-                                if self._save_sequence_immediate(seq):
-                                    batch_saved += 1
-                                    saved_count += 1
-                                    acc = seq.get('accession')
-                                    if acc:
-                                        self.completed_ids.add(acc)
-                            sequences.extend(batch_result)
-                            pbar.update(len(batch_result))
-                            pbar.write(f"[SUCCESS] Batch {batch_num} retry successful: {batch_saved} sequences saved")
-                            sys.stdout.flush()
-                            self._save_checkpoint()
-                        except Exception as e:
-                            remaining_failed.append((batch_num, batch_ids, str(e)))
-                            pbar.write(f"[WARNING] Batch {batch_num} retry failed: {e}")
-                            sys.stdout.flush()
+                    try:
+                        for completed_future in asyncio.as_completed(retry_tasks.keys()):
+                            try:
+                                batch_result = await completed_future
+                                
+                                # Find which batch this belongs to
+                                batch_num = None
+                                batch_ids = None
+                                for bn, bid, task in retry_batch_info:
+                                    if task.done():
+                                        try:
+                                            if task.result() == batch_result or task == completed_future:
+                                                batch_num = bn
+                                                batch_ids = bid
+                                                break
+                                        except Exception:
+                                            continue
+                                
+                                # Fallback: find by checking retry_tasks
+                                if batch_num is None:
+                                    for task, (bn, bid) in list(retry_tasks.items()):
+                                        if task.done():
+                                            try:
+                                                if task.result() == batch_result:
+                                                    batch_num = bn
+                                                    batch_ids = bid
+                                                    break
+                                            except Exception:
+                                                continue
+                                
+                                if batch_num is None or not isinstance(batch_result, list):
+                                    # Try to get from task directly
+                                    for bn, bid, task in retry_batch_info:
+                                        if task.done():
+                                            try:
+                                                result = task.result()
+                                                if isinstance(result, list):
+                                                    batch_num = bn
+                                                    batch_ids = bid
+                                                    batch_result = result
+                                                    break
+                                            except Exception:
+                                                continue
+                                
+                                if batch_num is None or not isinstance(batch_result, list) or len(batch_result) == 0:
+                                    continue
+                                
+                                batch_saved = 0
+                                for seq in batch_result:
+                                    if isinstance(seq, dict) and self._save_sequence_immediate(seq):
+                                        batch_saved += 1
+                                        saved_count += 1
+                                        acc = seq.get('accession')
+                                        if acc:
+                                            self.completed_ids.add(acc)
+                                sequences.extend(batch_result)
+                                pbar.update(len(batch_result))
+                                pbar.write(f"[SUCCESS] Batch {batch_num} retry successful: {batch_saved} sequences saved")
+                                sys.stdout.flush()
+                                self._save_checkpoint()
+                            except Exception as e:
+                                error_msg = str(e)
+                                if 'coroutine' in error_msg.lower():
+                                    error_msg = f"Async error: {type(e).__name__}"
+                                # Find batch number
+                                batch_num_failed = None
+                                batch_ids_failed = None
+                                for bn, bid, task in retry_batch_info:
+                                    if task.done():
+                                        try:
+                                            task.exception()
+                                        except Exception:
+                                            batch_num_failed = bn
+                                            batch_ids_failed = bid
+                                            break
+                                if batch_num_failed is None and retry_batch_info:
+                                    batch_num_failed, batch_ids_failed, _ = retry_batch_info[0]
+                                
+                                if batch_num_failed is not None:
+                                    remaining_failed.append((batch_num_failed, batch_ids_failed or [], error_msg))
+                                    pbar.write(f"[WARNING] Batch {batch_num_failed} retry failed: {error_msg}")
+                                    sys.stdout.flush()
+                    except Exception as retry_outer_e:
+                        error_msg = str(retry_outer_e)
+                        if 'coroutine' in error_msg.lower():
+                            logger.error("Async error in retry processing - waiting for all retry tasks...")
+                            # Wait for all retry tasks
+                            for bn, bid, task in retry_batch_info:
+                                try:
+                                    if not task.done():
+                                        await asyncio.wait_for(task, timeout=300)
+                                except Exception:
+                                    pass
+                                if task.done():
+                                    try:
+                                        result = task.result()
+                                        if isinstance(result, list):
+                                            sequences.extend(result)
+                                            for seq in result:
+                                                if isinstance(seq, dict) and self._save_sequence_immediate(seq):
+                                                    saved_count += 1
+                                                    acc = seq.get('accession')
+                                                    if acc:
+                                                        self.completed_ids.add(acc)
+                                            pbar.update(len(result))
+                                    except Exception as te:
+                                        error_str = str(te)
+                                        if 'coroutine' not in error_str.lower():
+                                            remaining_failed.append((bn, bid, error_str))
+                        else:
+                            logger.error(f"Error in retry loop: {error_msg}")
+                            # Mark remaining as failed
+                            for bn, bid, task in retry_batch_info:
+                                if not task.done():
+                                    remaining_failed.append((bn, bid, error_msg))
                 
                 failed_batches = remaining_failed
         

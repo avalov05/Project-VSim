@@ -81,27 +81,128 @@ class DataCollector:
         
         viable_sequences = []
         ncbi_failed = False
+        ncbi_error = None
+        
+        # Attempt NCBI download with proper error handling
+        logger.info("Attempting to download viable genomes from NCBI...")
+        logger.info("This step will complete fully before proceeding to next steps.")
+        logger.info("="*70)
         
         try:
+            # Ensure the harvester completes the entire download process
             viable_sequences = await self.harvester.harvest_all_viable_genomes(max_sequences=max_viable)
             
-            if not viable_sequences or len(viable_sequences) == 0:
+            # Check if we got any sequences (even if empty list, the process completed)
+            if viable_sequences is None:
+                logger.warning("="*70)
+                logger.warning("WARNING: harvest_all_viable_genomes returned None")
+                logger.warning("This may indicate the download process encountered errors.")
+                logger.warning("="*70)
+                ncbi_failed = True
+                viable_sequences = []
+            elif len(viable_sequences) == 0:
                 logger.warning("="*70)
                 logger.warning("WARNING: No viable genomes downloaded from NCBI!")
+                logger.warning("The download process completed but returned 0 sequences.")
                 logger.warning("This is common in Colab due to NCBI API restrictions.")
                 logger.warning("="*70)
                 ncbi_failed = True
             else:
                 logger.info(f"✓ Successfully downloaded {len(viable_sequences):,} viable genomes from NCBI")
+                logger.info("="*70)
+                logger.info("NCBI download step completed successfully.")
+                logger.info("="*70)
         
         except Exception as e:
-            logger.error(f"NCBI download failed: {e}")
-            logger.warning("="*70)
-            logger.warning("NCBI download failed - this is common in Colab")
-            logger.warning("The system will continue with synthetic data generation.")
-            logger.warning("="*70)
-            ncbi_failed = True
-            viable_sequences = []
+            # Safely extract error message
+            try:
+                error_msg = str(e)
+                error_type = type(e).__name__
+            except Exception:
+                error_msg = "Unknown error"
+                error_type = "Exception"
+            
+            # Check for coroutine-related errors (common in Colab)
+            if 'coroutine' in error_msg.lower() or (hasattr(e, '__class__') and 'coroutine' in str(type(e)).lower()):
+                error_msg = f"Async/coroutine error during NCBI download: {error_type}"
+                logger.error(f"NCBI download encountered async error: {error_type}")
+                logger.error("This is often caused by Colab's async environment. The download process may have partially completed.")
+                logger.error("Checking for any successfully downloaded sequences...")
+                
+                # Try to recover any sequences that were downloaded before the error
+                try:
+                    # Check if harvester has any sequences in memory or on disk
+                    # The harvester saves sequences incrementally, so check disk
+                    from pathlib import Path
+                    viable_dir = self.harvester.viable_dir
+                    val_viable_dir = self.harvester.val_viable_dir
+                    
+                    if viable_dir.exists():
+                        viable_files = list(viable_dir.glob("*.fasta"))
+                        val_files = list(val_viable_dir.glob("*.fasta")) if val_viable_dir.exists() else []
+                        total_files = len(viable_files) + len(val_files)
+                        
+                        if total_files > 0:
+                            logger.info(f"Found {total_files} sequences that were saved to disk before the error.")
+                            logger.info("Using these sequences instead of generating synthetic data.")
+                            # Read sequences from disk
+                            viable_sequences = []
+                            for filepath in viable_files + val_files:
+                                try:
+                                    from Bio import SeqIO
+                                    for record in SeqIO.parse(filepath, "fasta"):
+                                        viable_sequences.append({
+                                            'accession': record.id,
+                                            'sequence': str(record.seq),
+                                            'description': record.description
+                                        })
+                                except Exception:
+                                    continue
+                            
+                            if len(viable_sequences) > 0:
+                                logger.info(f"✓ Recovered {len(viable_sequences):,} sequences from disk")
+                                ncbi_failed = False
+                            else:
+                                logger.warning("Could not read sequences from disk files.")
+                                ncbi_failed = True
+                        else:
+                            logger.warning("No sequences found on disk.")
+                            ncbi_failed = True
+                    else:
+                        logger.warning("Viable directory does not exist.")
+                        ncbi_failed = True
+                except Exception as recovery_error:
+                    logger.warning(f"Could not recover sequences: {recovery_error}")
+                    ncbi_failed = True
+            else:
+                logger.error(f"NCBI download failed: {error_msg}")
+                logger.error(f"Error type: {error_type}")
+                ncbi_error = error_msg
+                ncbi_failed = True
+                viable_sequences = []
+            
+            if ncbi_failed:
+                logger.warning("="*70)
+                logger.warning("NCBI download step completed with errors.")
+                if skip_ncbi_if_fails:
+                    logger.warning("Fallback mode enabled - will generate synthetic data.")
+                else:
+                    logger.warning("Fallback mode disabled - will not generate synthetic data.")
+                logger.warning("="*70)
+        
+        # Log completion of NCBI step
+        logger.info("")
+        logger.info("="*70)
+        logger.info("NCBI DOWNLOAD STEP COMPLETE")
+        logger.info("="*70)
+        if ncbi_failed:
+            logger.info(f"Status: Failed ({len(viable_sequences)} sequences recovered)")
+            if ncbi_error:
+                logger.info(f"Error: {ncbi_error}")
+        else:
+            logger.info(f"Status: Success ({len(viable_sequences)} sequences downloaded)")
+        logger.info("="*70)
+        logger.info("")
         
         # If NCBI failed and we're in fallback mode, generate synthetic viable genomes
         if ncbi_failed and skip_ncbi_if_fails:
